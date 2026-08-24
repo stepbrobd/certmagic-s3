@@ -354,3 +354,29 @@ func TestStatReportsMissingKeys(t *testing.T) {
 		t.Fatal("modified time is missing")
 	}
 }
+
+// Load must still report a missing key as fs.ErrNotExist now that it no longer
+// asks Exists first
+func TestLoadMissingKey(t *testing.T) {
+	prefix := testPrefix(t)
+	storage := newTestStorage(t, prefix)
+
+	ctx := t.Context()
+
+	if _, err := storage.Load(ctx, "certificates/absent.crt"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("expected fs.ErrNotExist, got %v", err)
+	}
+
+	want := []byte("certificate bytes")
+	if err := storage.Store(ctx, "certificates/present.crt", want); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	got, err := storage.Load(ctx, "certificates/present.crt")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("loaded %q, want %q", got, want)
+	}
+}

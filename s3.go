@@ -493,23 +493,29 @@ func (s3 *S3) Store(ctx context.Context, key string, value []byte) error {
 }
 
 func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
-	if !s3.Exists(ctx, key) {
-		return nil, fs.ErrNotExist
-	}
+	prefixed := s3.KeyPrefix(key)
 
-	key = s3.KeyPrefix(key)
+	s3.logger.Debug(fmt.Sprintf("Load key: %s", prefixed))
 
-	s3.logger.Debug(fmt.Sprintf("Load key: %s", key))
-
-	object, err := s3.client.GetObject(ctx, s3.Bucket, key, minio.GetObjectOptions{})
-
+	// a preceding Exists call cost a second round trip and still raced, the key
+	// could vanish between the check and the read
+	object, err := s3.client.GetObject(ctx, s3.Bucket, prefixed, minio.GetObjectOptions{})
 	if err != nil {
 		return nil, err
 	}
 
 	defer object.Close()
 
-	return io.ReadAll(object)
+	body, err := io.ReadAll(object)
+	if err != nil {
+		if minio.ToErrorResponse(err).Code == minio.NoSuchKey {
+			return nil, fs.ErrNotExist
+		}
+
+		return nil, err
+	}
+
+	return body, nil
 }
 
 func (s3 *S3) Delete(ctx context.Context, key string) error {
