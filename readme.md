@@ -63,6 +63,19 @@ From Environment
     S3_PREFIX
     S3_INSECURE
 
+## Locking
+
+Certificate issuance is serialized across every instance sharing a bucket.
+
+Locks are objects under the `locks/` prefix. They are created with
+`If-None-Match: *` so exactly one instance can take a given lock, and the holder
+refreshes its own lock every 15s. An instance that stops refreshing loses the
+lock after 60s, and a single waiter reclaims it with a compare-and-swap on the
+object's ETag.
+
+This needs a backend that honours conditional writes on PutObject. Verified
+against Cloudflare R2 and MinIO. AWS S3 has supported them since November 2024.
+
 AWS IAM Provider Example
 
 Caddyfile Example
