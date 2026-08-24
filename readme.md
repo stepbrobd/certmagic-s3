@@ -8,12 +8,12 @@ Build
 
     go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-    xcaddy build --output ./caddy --with github.com/ss098/certmagic-s3
+    xcaddy build --output ./caddy --with github.com/stepbrobd/certmagic-s3
 
 Build container
 
     FROM caddy:builder AS builder
-    RUN xcaddy build --with github.com/ss098/certmagic-s3 --with ...
+    RUN xcaddy build --with github.com/stepbrobd/certmagic-s3 --with ...
 
     FROM caddy
     COPY --from=builder /usr/bin/caddy /usr/bin/caddy

@@ -1,4 +1,4 @@
-package certmagic_s3
+package s3
 
 import (
 	"bytes"
