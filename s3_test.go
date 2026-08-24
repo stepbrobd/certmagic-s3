@@ -425,3 +425,48 @@ func TestDeleteRemovesEverythingBelow(t *testing.T) {
 		t.Fatalf("second delete: %v", err)
 	}
 }
+
+// certmagic takes short lived locks constantly for storage cleaning and ARI
+// so a waiter routinely reads a lock that its holder deletes mid read
+// that must look like a free lock, never like an error
+func TestLockChurnNeverErrors(t *testing.T) {
+	storage := newTestStorage(t, testPrefix(t))
+	ctx := t.Context()
+
+	const (
+		contenders = 6
+		rounds     = 12
+	)
+
+	var (
+		failures atomic.Int64
+		first    atomic.Value
+		wg       sync.WaitGroup
+	)
+
+	for i := range contenders {
+
+		wg.Go(func() {
+
+			for range rounds {
+				if err := storage.Lock(ctx, "churn"); err != nil {
+					failures.Add(1)
+					first.CompareAndSwap(nil, fmt.Sprintf("contender %d: %v", i, err))
+
+					continue
+				}
+
+				if err := storage.Unlock(ctx, "churn"); err != nil {
+					failures.Add(1)
+					first.CompareAndSwap(nil, fmt.Sprintf("contender %d unlock: %v", i, err))
+				}
+			}
+		})
+	}
+
+	wg.Wait()
+
+	if n := failures.Load(); n != 0 {
+		t.Fatalf("lock churn produced %d errors, first was %v", n, first.Load())
+	}
+}

@@ -49,6 +49,8 @@ const (
 
 	// how often a waiter retries acquisition
 	lockPollInterval = time.Second
+	// how many transient s3 failures to absorb before failing an acquisition
+	lockRetryLimit = 5
 )
 
 // lockInfo is the body of a lock object
@@ -253,6 +255,17 @@ func (s3 *S3) Lock(ctx context.Context, name string) error {
 		return err
 	}
 
+	// a hiccup talking to s3 must not fail issuance, a persistent fault must
+	transient := 0
+	retry := func(cause error) error {
+		transient++
+		if transient > lockRetryLimit {
+			return cause
+		}
+		s3.logger.Warn(fmt.Sprintf("acquiring lock %s failed, retrying: %v", key, cause))
+		return wait(ctx, lockPollInterval)
+	}
+
 	for {
 		createErr := s3.createLock(ctx, key, owner)
 		if createErr == nil {
@@ -260,7 +273,10 @@ func (s3 *S3) Lock(ctx context.Context, name string) error {
 			return nil
 		}
 		if !isPreconditionFailed(createErr) {
-			return createErr
+			if err := retry(createErr); err != nil {
+				return err
+			}
+			continue
 		}
 
 		existing, etag, loadErr := s3.loadLock(ctx, key)
@@ -269,7 +285,10 @@ func (s3 *S3) Lock(ctx context.Context, name string) error {
 			continue
 		}
 		if loadErr != nil {
-			return loadErr
+			if err := retry(loadErr); err != nil {
+				return err
+			}
+			continue
 		}
 
 		if time.Now().Before(existing.Expires) {
@@ -288,7 +307,10 @@ func (s3 *S3) Lock(ctx context.Context, name string) error {
 			return nil
 		}
 		if !isPreconditionFailed(replaceErr) {
-			return replaceErr
+			if err := retry(replaceErr); err != nil {
+				return err
+			}
+			continue
 		}
 
 		if waitErr := wait(ctx, lockPollInterval); waitErr != nil {
