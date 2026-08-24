@@ -87,6 +87,10 @@ type S3 struct {
 }
 
 func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
+	// the string fields are replaced in Provision, but these are parsed here and
+	// a placeholder has to resolve before it reaches strconv
+	repl := caddy.NewReplacer()
+
 	for d.Next() {
 
 		key := d.Val()
@@ -112,13 +116,13 @@ func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		case "prefix":
 			s3.Prefix = value
 		case "insecure":
-			insecure, err := strconv.ParseBool(value)
+			insecure, err := strconv.ParseBool(repl.ReplaceKnown(value, ""))
 			if err != nil {
 				return d.Err("Invalid usage of insecure in s3-storage config: " + err.Error())
 			}
 			s3.Insecure = insecure
 		case "use_iam_provider":
-			boolValue, err := strconv.ParseBool(value)
+			boolValue, err := strconv.ParseBool(repl.ReplaceKnown(value, ""))
 			if err != nil {
 				return d.Err("Invalid usage of use_iam_provider in s3-storage config: " + err.Error())
 			}
