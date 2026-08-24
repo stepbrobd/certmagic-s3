@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"strings"
 	"sync"
@@ -316,5 +318,39 @@ func TestListReturnsOnlyRealKeys(t *testing.T) {
 		if strings.HasPrefix(key, lockPrefix+"/") {
 			t.Fatalf("lock key %q leaked into a data listing", key)
 		}
+	}
+}
+
+// Stat used to swallow every failure and answer with a zero KeyInfo and a nil
+// error, so a missing key was indistinguishable from an empty one
+func TestStatReportsMissingKeys(t *testing.T) {
+	prefix := testPrefix(t)
+	storage := newTestStorage(t, prefix)
+
+	ctx := t.Context()
+
+	if _, err := storage.Stat(ctx, "certificates/absent.crt"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("expected fs.ErrNotExist for a missing key, got %v", err)
+	}
+
+	if err := storage.Store(ctx, "certificates/present.crt", []byte("hello")); err != nil {
+		t.Fatalf("store: %v", err)
+	}
+
+	info, err := storage.Stat(ctx, "certificates/present.crt")
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if info.Key != "certificates/present.crt" {
+		t.Fatalf("expected the unprefixed key back, got %q", info.Key)
+	}
+	if info.Size != 5 {
+		t.Fatalf("expected size 5, got %d", info.Size)
+	}
+	if !info.IsTerminal {
+		t.Fatal("a stored value must be terminal")
+	}
+	if info.Modified.IsZero() {
+		t.Fatal("modified time is missing")
 	}
 }

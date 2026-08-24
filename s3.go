@@ -561,24 +561,29 @@ func (s3 *S3) List(ctx context.Context, prefix string, recursive bool) ([]string
 }
 
 func (s3 *S3) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
-	key = s3.KeyPrefix(key)
+	prefixed := s3.KeyPrefix(key)
 
-	object, err := s3.client.StatObject(ctx, s3.Bucket, key, minio.StatObjectOptions{})
-
+	object, err := s3.client.StatObject(ctx, s3.Bucket, prefixed, minio.StatObjectOptions{})
 	if err != nil {
-		s3.logger.Error(fmt.Sprintf("Stat key: %s, error: %v", key, err))
+		// returning a nil error here reported every missing key as a zero sized
+		// one that exists, callers cannot tell the two apart
+		if minio.ToErrorResponse(err).Code == minio.NoSuchKey {
+			return certmagic.KeyInfo{}, fs.ErrNotExist
+		}
 
-		return certmagic.KeyInfo{}, nil
+		return certmagic.KeyInfo{}, err
 	}
 
-	s3.logger.Debug(fmt.Sprintf("Stat key: %s, size: %d bytes", key, object.Size))
+	s3.logger.Debug(fmt.Sprintf("Stat key: %s, size: %d bytes", prefixed, object.Size))
 
 	return certmagic.KeyInfo{
-		Key:        object.Key,
-		Modified:   object.LastModified,
-		Size:       object.Size,
-		IsTerminal: strings.HasSuffix(object.Key, "/"),
-	}, err
+		// the caller asked with an unprefixed key and expects it back
+		Key:      key,
+		Modified: object.LastModified,
+		Size:     object.Size,
+		// terminal means the key holds a value rather than only other keys
+		IsTerminal: !strings.HasSuffix(prefixed, "/"),
+	}, nil
 }
 
 func (s3 *S3) KeyPrefix(key string) string {
