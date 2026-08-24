@@ -1,3 +1,5 @@
-.idea
-caddy
-Caddyfile
+*.a
+*.o
+.direnv
+result
+result-*
