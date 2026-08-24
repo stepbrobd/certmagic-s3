@@ -379,7 +379,7 @@ func (s3 *S3) loadLock(ctx context.Context, key string) (lockInfo, string, error
 
 	stat, err := object.Stat()
 	if err != nil {
-		if minio.ToErrorResponse(err).Code == minio.NoSuchKey {
+		if isNotExist(err) {
 			return stored, "", fs.ErrNotExist
 		}
 		return stored, "", err
@@ -387,6 +387,10 @@ func (s3 *S3) loadLock(ctx context.Context, key string) (lockInfo, string, error
 
 	body, err := io.ReadAll(object)
 	if err != nil {
+		// the holder can release between the stat and this read
+		if isNotExist(err) {
+			return stored, "", fs.ErrNotExist
+		}
 		return stored, "", err
 	}
 
@@ -473,6 +477,11 @@ func wait(ctx context.Context, d time.Duration) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// minio only translates NoSuchKey on some paths so every read has to test it
+func isNotExist(err error) bool {
+	return minio.ToErrorResponse(err).Code == minio.NoSuchKey
 }
 
 // a conditional put that lost the race answers 412, some backends answer 409
