@@ -380,3 +380,48 @@ func TestLoadMissingKey(t *testing.T) {
 		t.Fatalf("loaded %q, want %q", got, want)
 	}
 }
+
+// certmagic removes a directory by naming it, deleting only the single object
+// left expired ech configs and old certificate folders behind forever
+func TestDeleteRemovesEverythingBelow(t *testing.T) {
+	prefix := testPrefix(t)
+	storage := newTestStorage(t, prefix)
+
+	ctx := t.Context()
+
+	keys := []string{
+		"ech/configs/abc",
+		"ech/configs/abc/key.bin",
+		"ech/configs/abc/config.bin",
+		"ech/configs/abc/meta.json",
+	}
+	for _, key := range keys {
+		if err := storage.Store(ctx, key, []byte("x")); err != nil {
+			t.Fatalf("store %s: %v", key, err)
+		}
+	}
+
+	// a sibling sharing the name as a string prefix must survive
+	if err := storage.Store(ctx, "ech/configs/abcdef", []byte("x")); err != nil {
+		t.Fatalf("store sibling: %v", err)
+	}
+
+	if err := storage.Delete(ctx, "ech/configs/abc"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+
+	for _, key := range keys {
+		if storage.Exists(ctx, key) {
+			t.Fatalf("%s survived the delete", key)
+		}
+	}
+
+	if !storage.Exists(ctx, "ech/configs/abcdef") {
+		t.Fatal("delete of ech/configs/abc also removed ech/configs/abcdef")
+	}
+
+	// deleting something already gone is not an error
+	if err := storage.Delete(ctx, "ech/configs/abc"); err != nil {
+		t.Fatalf("second delete: %v", err)
+	}
+}

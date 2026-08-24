@@ -519,11 +519,52 @@ func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
 }
 
 func (s3 *S3) Delete(ctx context.Context, key string) error {
-	key = s3.KeyPrefix(key)
+	prefixed := s3.KeyPrefix(key)
 
-	s3.logger.Debug(fmt.Sprintf("Delete key: %s", key))
+	s3.logger.Debug(fmt.Sprintf("Delete key: %s", prefixed))
 
-	return s3.client.RemoveObject(ctx, s3.Bucket, key, minio.RemoveObjectOptions{})
+	if err := s3.client.RemoveObject(ctx, s3.Bucket, prefixed, minio.RemoveObjectOptions{}); err != nil {
+		if minio.ToErrorResponse(err).Code != minio.NoSuchKey {
+			return err
+		}
+	}
+
+	// certmagic deletes a directory by naming it, expecting everything below to
+	// go with it, removing the single object left expired ech configs and old
+	// certificate folders in the bucket forever
+	// the trailing separator keeps "a/b" from also matching "a/bc"
+	listing := s3.client.ListObjects(ctx, s3.Bucket, minio.ListObjectsOptions{
+		Prefix:    prefixed + "/",
+		Recursive: true,
+	})
+
+	below := make([]minio.ObjectInfo, 0)
+
+	for object := range listing {
+		if object.Err != nil {
+			return object.Err
+		}
+
+		below = append(below, object)
+	}
+
+	if len(below) == 0 {
+		return nil
+	}
+
+	objects := make(chan minio.ObjectInfo, len(below))
+	for _, object := range below {
+		objects <- object
+	}
+	close(objects)
+
+	for removal := range s3.client.RemoveObjects(ctx, s3.Bucket, objects, minio.RemoveObjectsOptions{}) {
+		if removal.Err != nil {
+			return removal.Err
+		}
+	}
+
+	return nil
 }
 
 func (s3 *S3) Exists(ctx context.Context, key string) bool {
