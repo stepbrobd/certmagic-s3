@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -263,4 +264,57 @@ func envOr(key, fallback string) string {
 		return value
 	}
 	return fallback
+}
+
+// List used to size its slice with len of a channel, so every result carried
+// leading empty keys, and lock objects leaked into data listings
+func TestListReturnsOnlyRealKeys(t *testing.T) {
+	prefix := testPrefix(t)
+	storage := newTestStorage(t, prefix)
+
+	ctx := t.Context()
+
+	for _, key := range []string{"certificates/a.crt", "certificates/a.key", "certificates/b.crt"} {
+		if err := storage.Store(ctx, key, []byte("x")); err != nil {
+			t.Fatalf("store %s: %v", key, err)
+		}
+	}
+
+	// a live lock must not show up as stored data
+	if err := storage.Lock(ctx, "issue_cert_a"); err != nil {
+		t.Fatalf("lock: %v", err)
+	}
+	defer storage.Unlock(ctx, "issue_cert_a")
+
+	keys, err := storage.List(ctx, "certificates", true)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+
+	if len(keys) != 3 {
+		t.Fatalf("expected 3 keys, got %d: %q", len(keys), keys)
+	}
+
+	for _, key := range keys {
+		if key == "" {
+			t.Fatalf("empty key in %q", keys)
+		}
+		if strings.HasPrefix(key, "/") {
+			t.Fatalf("key %q keeps a leading separator", key)
+		}
+		if !strings.HasPrefix(key, "certificates/") {
+			t.Fatalf("unexpected key %q", key)
+		}
+	}
+
+	// the whole bucket must not expose the lock subtree either
+	all, err := storage.List(ctx, "", true)
+	if err != nil {
+		t.Fatalf("list all: %v", err)
+	}
+	for _, key := range all {
+		if strings.HasPrefix(key, lockPrefix+"/") {
+			t.Fatalf("lock key %q leaked into a data listing", key)
+		}
+	}
 }

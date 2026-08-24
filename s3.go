@@ -533,16 +533,28 @@ func (s3 *S3) Exists(ctx context.Context, key string) bool {
 }
 
 func (s3 *S3) List(ctx context.Context, prefix string, recursive bool) ([]string, error) {
-
 	objects := s3.client.ListObjects(ctx, s3.Bucket, minio.ListObjectsOptions{
 		Prefix:    s3.KeyPrefix(prefix),
 		Recursive: recursive,
 	})
 
-	keys := make([]string, len(objects))
+	// len of a channel is its queue depth, sizing the slice with it prepended
+	// that many empty keys to every result
+	keys := make([]string, 0)
 
 	for object := range objects {
-		keys = append(keys, s3.CutKeyPrefix(object.Key))
+		if object.Err != nil {
+			return nil, object.Err
+		}
+
+		key := s3.CutKeyPrefix(object.Key)
+
+		// locks share the bucket but are bookkeeping, not stored data
+		if key == "" || strings.HasPrefix(key, lockPrefix+"/") {
+			continue
+		}
+
+		keys = append(keys, key)
 	}
 
 	return keys, nil
@@ -573,8 +585,11 @@ func (s3 *S3) KeyPrefix(key string) string {
 	return path.Join(s3.Prefix, key)
 }
 func (s3 *S3) CutKeyPrefix(key string) string {
-	cutted, _ := strings.CutPrefix(key, s3.Prefix)
-	return cutted
+	cut, _ := strings.CutPrefix(key, s3.Prefix)
+
+	// without trimming the separator a configured prefix yields "/a/b" while an
+	// empty one yields "a/b" for the same object
+	return strings.TrimPrefix(cut, "/")
 }
 
 func (s3 *S3) String() string {
