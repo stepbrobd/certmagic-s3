@@ -427,10 +427,13 @@ func (s3 *S3) keepLockFresh(ctx context.Context, key, owner string) {
 
 		current, etag, err := s3.loadLock(ctx, key)
 		if err != nil {
-			if !errors.Is(err, fs.ErrNotExist) {
-				s3.logger.Error(fmt.Sprintf("reading lock %s to extend it: %v", key, err))
+			// nothing is left to extend once the object is gone
+			if errors.Is(err, fs.ErrNotExist) {
+				return
 			}
-			return
+			// giving up here would let a lock we still hold expire under us
+			s3.logger.Warn(fmt.Sprintf("reading lock %s to extend it, retrying: %v", key, err))
+			continue
 		}
 
 		if current.Owner != owner {
@@ -439,8 +442,13 @@ func (s3 *S3) keepLockFresh(ctx context.Context, key, owner string) {
 		}
 
 		if err := s3.replaceLock(ctx, key, owner, etag); err != nil {
-			s3.logger.Error(fmt.Sprintf("extending lock %s: %v", key, err))
-			return
+			// losing the swap means the lock moved on, anything else is transient
+			if isPreconditionFailed(err) {
+				s3.logger.Warn(fmt.Sprintf("lock %s changed under the refresh, stopping", key))
+				return
+			}
+			s3.logger.Warn(fmt.Sprintf("extending lock %s, retrying: %v", key, err))
+			continue
 		}
 	}
 }
