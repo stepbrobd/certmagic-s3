@@ -166,7 +166,7 @@ func TestLockReclaimsAbandoned(t *testing.T) {
 	name := "issue_cert_abandoned.example.com"
 
 	storage := newTestStorage(t, prefix)
-	key := storage.LockKey(name)
+	key := storage.lockKey(name)
 
 	abandoned, err := json.Marshal(lockInfo{
 		Owner:   "dead-node/deadbeef",

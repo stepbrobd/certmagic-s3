@@ -250,7 +250,7 @@ func (s3 *S3) CertMagicStorage() (certmagic.Storage, error) {
 // a lock whose holder stopped extending it past its expiry is reclaimed by
 // exactly one waiter
 func (s3 *S3) Lock(ctx context.Context, name string) error {
-	key := s3.LockKey(name)
+	key := s3.lockKey(name)
 
 	owner, err := newLockOwner()
 	if err != nil {
@@ -331,7 +331,7 @@ func (s3 *S3) Lock(ctx context.Context, name string) error {
 // a lock this instance no longer owns is left for its expiry to clear so a
 // late Unlock cannot release someone else
 func (s3 *S3) Unlock(ctx context.Context, name string) error {
-	key := s3.LockKey(name)
+	key := s3.lockKey(name)
 
 	s3.locksMu.Lock()
 	current, mine := s3.locks[key]
@@ -481,8 +481,8 @@ func (s3 *S3) keepLockFresh(ctx context.Context, key, owner string) {
 	}
 }
 
-// LockKey returns the object key backing a named lock
-func (s3 *S3) LockKey(name string) string {
+// lockKey returns the object key backing a named lock
+func (s3 *S3) lockKey(name string) string {
 	return path.Join(s3.Prefix, lockPrefix, name+".lock")
 }
 
