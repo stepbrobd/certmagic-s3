@@ -192,6 +192,8 @@ func (s3 *S3) Provision(ctx caddy.Context) error {
 	if s3.Prefix == "" {
 		s3.Prefix = os.Getenv("S3_PREFIX")
 	}
+	// a separator at either end puts every key under a "/" directory that listings never find
+	s3.Prefix = strings.Trim(s3.Prefix, "/")
 
 	if !s3.Insecure {
 		insecure := os.Getenv("S3_INSECURE")
