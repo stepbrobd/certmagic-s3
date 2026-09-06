@@ -10,9 +10,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"path"
 	"strconv"
@@ -817,17 +815,14 @@ func (s3 *S3) String() string {
 	return fmt.Sprintf("S3 Storage Host: %s, Bucket: %s, Prefix: %s", s3.Host, s3.Bucket, s3.Prefix)
 }
 
-func validateHost(h string) error {
-	x, _, err := net.SplitHostPort(h)
-	if err == nil && x != "" {
-		h = x
+// validateHost rejects a scheme, the client dials host or host:port over http or https as configured
+func validateHost(host string) error {
+	if host == "" {
+		return errors.New("host is empty")
 	}
-	u, err := url.Parse(h)
-	if err != nil {
-		return fmt.Errorf("invalid host: must be a hostname: %w", err)
+	if strings.Contains(host, "://") {
+		return fmt.Errorf("host must be a hostname or host:port without a scheme, got %q", host)
 	}
-	if u.Scheme != "" {
-		return errors.New("host must not contain a scheme prefix like https://")
-	}
+
 	return nil
 }
