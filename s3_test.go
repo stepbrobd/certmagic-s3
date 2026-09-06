@@ -134,6 +134,10 @@ func TestLockBlocksWhileHeld(t *testing.T) {
 		t.Fatalf("holder lock: %v", err)
 	}
 
+	if held, err := waiter.TryLock(ctx, name); held || err != nil {
+		t.Fatalf("try lock while held: %v, %v", held, err)
+	}
+
 	acquired := make(chan error, 1)
 	go func() { acquired <- waiter.Lock(ctx, name) }()
 
@@ -158,6 +162,13 @@ func TestLockBlocksWhileHeld(t *testing.T) {
 
 	if err := waiter.Unlock(ctx, name); err != nil {
 		t.Fatalf("waiter unlock: %v", err)
+	}
+
+	if held, err := holder.TryLock(ctx, name); !held || err != nil {
+		t.Fatalf("try lock while free: %v, %v", held, err)
+	}
+	if err := holder.Unlock(ctx, name); err != nil {
+		t.Fatalf("holder unlock after try: %v", err)
 	}
 }
 

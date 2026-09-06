@@ -33,6 +33,7 @@ var (
 	_ caddy.Module          = (*S3)(nil)
 	_ certmagic.Storage     = (*S3)(nil)
 	_ certmagic.Locker      = (*S3)(nil)
+	_ certmagic.TryLocker   = (*S3)(nil)
 	_ caddy.Provisioner     = (*S3)(nil)
 	_ caddyfile.Unmarshaler = (*S3)(nil)
 )
@@ -285,6 +286,31 @@ func (s3 *S3) Lock(ctx context.Context, name string) error {
 	}
 
 	return err
+}
+
+// TryLock takes the named lock when it is free and reports false without
+// waiting when a live holder has it
+func (s3 *S3) TryLock(ctx context.Context, name string) (bool, error) {
+	key := s3.lockKey(name)
+
+	owner, err := newLockOwner()
+	if err != nil {
+		return false, err
+	}
+
+	gate := s3.gate(key)
+	select {
+	case gate <- struct{}{}:
+	default:
+		return false, nil
+	}
+
+	held, err := s3.acquire(ctx, key, owner)
+	if !held {
+		<-gate
+	}
+
+	return held, err
 }
 
 // Unlock stops refreshing the named lock and marks it released
