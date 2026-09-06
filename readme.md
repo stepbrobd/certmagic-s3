@@ -2,6 +2,10 @@
 
 CertMagic S3-compatible driver written in Go.
 
+Unlike the original implementation, this fork includes proper serialization
+storage backend to prevent concurrent renewals causing issuers to rate limit
+Caddy.
+
 ## Guide
 
 Build
@@ -80,17 +84,13 @@ S3_INSECURE
 Certificate issuance is serialized across every instance sharing a bucket.
 
 Locks are objects under the `locks/` prefix. They are created with
-`If-None-Match: *` so exactly one instance can take a given lock, and the holder
-refreshes its own lock every 15s. An instance that stops refreshing loses the
-lock after 60s, and a single waiter reclaims it with a compare-and-swap on the
-object's ETag.
+`If-None-Match: *`, thus exactly one instance can take a given lock, and the
+holder refreshes its own lock every 15s. An instance that stops refreshing loses
+the lock after 60s, and a single waiter reclaims it with a compare-and-swap on
+the object's ETag. This needs a backend that honors conditional writes on
+PutObject (tested against Cloudflare R2 and MinIO).
 
-This needs a backend that honours conditional writes on PutObject. Verified
-against Cloudflare R2 and MinIO. AWS S3 has supported them since November 2024.
-
-AWS IAM Provider Example
-
-Caddyfile Example
+AWS IAM Provider Caddyfile example:
 
 ```caddyfile
 # Global Config
