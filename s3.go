@@ -364,7 +364,10 @@ func (s3 *S3) retry(ctx context.Context, key, what string, attempt func() (bool,
 		if done {
 			return err
 		}
-		if err != nil {
+		if err == nil {
+			// a healthy wait behind a live holder pays for no earlier hiccup
+			transient = 0
+		} else {
 			// a hiccup talking to s3 must not fail issuance, a persistent fault must
 			transient++
 			if transient > lockRetryLimit {
