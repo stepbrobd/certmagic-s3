@@ -262,7 +262,7 @@ func (s3 *S3) Lock(ctx context.Context, name string) error {
 		if transient > lockRetryLimit {
 			return cause
 		}
-		s3.logger.Warn(fmt.Sprintf("acquiring lock %s failed, retrying: %v", key, cause))
+		s3.logger.Warn("acquiring lock failed, retrying", zap.String("key", key), zap.Error(cause))
 		return wait(ctx, lockPollInterval)
 	}
 
@@ -298,7 +298,7 @@ func (s3 *S3) Lock(ctx context.Context, name string) error {
 			continue
 		}
 
-		s3.logger.Warn(fmt.Sprintf("reclaiming lock %s abandoned by %s", key, existing.Owner))
+		s3.logger.Warn("reclaiming an abandoned lock", zap.String("key", key), zap.String("owner", existing.Owner))
 
 		// swapping on the etag keeps two waiters from both reclaiming it
 		replaceErr := s3.replaceLock(ctx, key, owner, etag)
@@ -331,7 +331,7 @@ func (s3 *S3) Unlock(ctx context.Context, name string) error {
 	s3.locksMu.Unlock()
 
 	if !mine {
-		s3.logger.Debug(fmt.Sprintf("Unlock: %s is not held here, leaving it to expire", key))
+		s3.logger.Debug("unlock of a lock not held here, leaving it to expire", zap.String("key", key))
 		return nil
 	}
 
@@ -346,7 +346,7 @@ func (s3 *S3) Unlock(ctx context.Context, name string) error {
 	}
 
 	if existing.Owner != current.owner {
-		s3.logger.Warn(fmt.Sprintf("lock %s was reclaimed by %s, leaving it", key, existing.Owner))
+		s3.logger.Warn("lock was reclaimed, leaving it", zap.String("key", key), zap.String("owner", existing.Owner))
 		return nil
 	}
 
@@ -417,7 +417,7 @@ func (s3 *S3) loadLock(ctx context.Context, key string) (lockInfo, string, error
 	}
 
 	if err := json.Unmarshal(body, &stored); err != nil {
-		s3.logger.Warn(fmt.Sprintf("lock %s is unreadable, treating it as expired: %v", key, err))
+		s3.logger.Warn("lock is unreadable, treating it as expired", zap.String("key", key), zap.Error(err))
 		return lockInfo{}, stat.ETag, nil
 	}
 
@@ -454,22 +454,22 @@ func (s3 *S3) keepLockFresh(ctx context.Context, key, owner string) {
 				return
 			}
 			// giving up here would let a lock we still hold expire under us
-			s3.logger.Warn(fmt.Sprintf("reading lock %s to extend it, retrying: %v", key, err))
+			s3.logger.Warn("reading a held lock failed, retrying", zap.String("key", key), zap.Error(err))
 			continue
 		}
 
 		if current.Owner != owner {
-			s3.logger.Warn(fmt.Sprintf("lock %s is now held by %s, stopping refresh", key, current.Owner))
+			s3.logger.Warn("lock is held elsewhere, stopping refresh", zap.String("key", key), zap.String("owner", current.Owner))
 			return
 		}
 
 		if err := s3.replaceLock(ctx, key, owner, etag); err != nil {
 			// losing the swap means the lock moved on, anything else is transient
 			if isPreconditionFailed(err) {
-				s3.logger.Warn(fmt.Sprintf("lock %s changed under the refresh, stopping", key))
+				s3.logger.Warn("lock changed under the refresh, stopping", zap.String("key", key))
 				return
 			}
-			s3.logger.Warn(fmt.Sprintf("extending lock %s, retrying: %v", key, err))
+			s3.logger.Warn("extending a held lock failed, retrying", zap.String("key", key), zap.Error(err))
 			continue
 		}
 	}
@@ -528,7 +528,7 @@ func (s3 *S3) Store(ctx context.Context, key string, value []byte) error {
 	key = s3.KeyPrefix(key)
 	length := int64(len(value))
 
-	s3.logger.Debug(fmt.Sprintf("Store: %s, %d bytes", key, length))
+	s3.logger.Debug("storing", zap.String("key", key), zap.Int64("bytes", length))
 
 	_, err := s3.client.PutObject(ctx, s3.Bucket, key, bytes.NewReader(value), length, minio.PutObjectOptions{})
 
@@ -538,7 +538,7 @@ func (s3 *S3) Store(ctx context.Context, key string, value []byte) error {
 func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
 	prefixed := s3.KeyPrefix(key)
 
-	s3.logger.Debug(fmt.Sprintf("Load key: %s", prefixed))
+	s3.logger.Debug("loading", zap.String("key", prefixed))
 
 	// a preceding Exists call cost a second round trip and still raced, the key
 	// could vanish between the check and the read
@@ -564,7 +564,7 @@ func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
 func (s3 *S3) Delete(ctx context.Context, key string) error {
 	prefixed := s3.KeyPrefix(key)
 
-	s3.logger.Debug(fmt.Sprintf("Delete key: %s", prefixed))
+	s3.logger.Debug("deleting", zap.String("key", prefixed))
 
 	if err := s3.client.RemoveObject(ctx, s3.Bucket, prefixed, minio.RemoveObjectOptions{}); err != nil {
 		if minio.ToErrorResponse(err).Code != minio.NoSuchKey {
@@ -617,7 +617,7 @@ func (s3 *S3) Exists(ctx context.Context, key string) bool {
 
 	exists := err == nil
 
-	s3.logger.Debug(fmt.Sprintf("Check exists: %s, %t", key, exists))
+	s3.logger.Debug("checking", zap.String("key", key), zap.Bool("exists", exists))
 
 	return exists
 }
@@ -664,7 +664,7 @@ func (s3 *S3) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
 		return certmagic.KeyInfo{}, err
 	}
 
-	s3.logger.Debug(fmt.Sprintf("Stat key: %s, size: %d bytes", prefixed, object.Size))
+	s3.logger.Debug("stat", zap.String("key", prefixed), zap.Int64("bytes", object.Size))
 
 	return certmagic.KeyInfo{
 		// the caller asked with an unprefixed key and expects it back
