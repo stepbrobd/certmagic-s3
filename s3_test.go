@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -268,15 +270,20 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// List used to size its slice with len of a channel, so every result carried
-// leading empty keys, and lock objects leaked into data listings
-func TestListReturnsOnlyRealKeys(t *testing.T) {
+// certmagic walks storage by path component, so a non-recursive listing returns
+// the children of a directory and never a sibling sharing a string prefix
+func TestList(t *testing.T) {
 	prefix := testPrefix(t)
 	storage := newTestStorage(t, prefix)
 
 	ctx := t.Context()
 
-	for _, key := range []string{"certificates/a.crt", "certificates/a.key", "certificates/b.crt"} {
+	for _, key := range []string{
+		"certificates/issuer/a.example.com/a.example.com.crt",
+		"certificates/issuer/a.example.com/a.example.com.key",
+		"certificates/issuer/b.example.com/b.example.com.crt",
+		"certificates_backup/x",
+	} {
 		if err := storage.Store(ctx, key, []byte("x")); err != nil {
 			t.Fatalf("store %s: %v", key, err)
 		}
@@ -288,24 +295,31 @@ func TestListReturnsOnlyRealKeys(t *testing.T) {
 	}
 	defer storage.Unlock(ctx, "issue_cert_a")
 
-	keys, err := storage.List(ctx, "certificates", true)
-	if err != nil {
-		t.Fatalf("list: %v", err)
+	cases := []struct {
+		prefix    string
+		recursive bool
+		want      []string
+	}{
+		{"certificates", false, []string{"certificates/issuer"}},
+		{"certificates/issuer", false, []string{"certificates/issuer/a.example.com", "certificates/issuer/b.example.com"}},
+		{"certificates/issuer/a.example.com", false, []string{"certificates/issuer/a.example.com/a.example.com.crt", "certificates/issuer/a.example.com/a.example.com.key"}},
+		{"certificates", true, []string{
+			"certificates/issuer/a.example.com/a.example.com.crt",
+			"certificates/issuer/a.example.com/a.example.com.key",
+			"certificates/issuer/b.example.com/b.example.com.crt",
+		}},
+		{"", false, []string{"certificates", "certificates_backup"}},
+		{"missing", false, nil},
 	}
 
-	if len(keys) != 3 {
-		t.Fatalf("expected 3 keys, got %d: %q", len(keys), keys)
-	}
-
-	for _, key := range keys {
-		if key == "" {
-			t.Fatalf("empty key in %q", keys)
+	for _, c := range cases {
+		got, err := storage.List(ctx, c.prefix, c.recursive)
+		if err != nil {
+			t.Fatalf("list %q: %v", c.prefix, err)
 		}
-		if strings.HasPrefix(key, "/") {
-			t.Fatalf("key %q keeps a leading separator", key)
-		}
-		if !strings.HasPrefix(key, "certificates/") {
-			t.Fatalf("unexpected key %q", key)
+		sort.Strings(got)
+		if !slices.Equal(got, c.want) {
+			t.Errorf("List(%q, %v) = %q, want %q", c.prefix, c.recursive, got, c.want)
 		}
 	}
 
@@ -321,9 +335,9 @@ func TestListReturnsOnlyRealKeys(t *testing.T) {
 	}
 }
 
-// Stat used to swallow every failure and answer with a zero KeyInfo and a nil
-// error, so a missing key was indistinguishable from an empty one
-func TestStatReportsMissingKeys(t *testing.T) {
+// a missing key is fs.ErrNotExist, a stored value is terminal and a key with
+// other keys below it is a directory that exists
+func TestStat(t *testing.T) {
 	prefix := testPrefix(t)
 	storage := newTestStorage(t, prefix)
 
@@ -352,6 +366,24 @@ func TestStatReportsMissingKeys(t *testing.T) {
 	}
 	if info.Modified.IsZero() {
 		t.Fatal("modified time is missing")
+	}
+
+	info, err = storage.Stat(ctx, "certificates")
+	if err != nil {
+		t.Fatalf("stat directory: %v", err)
+	}
+	if info.IsTerminal {
+		t.Fatal("a directory must not be terminal")
+	}
+	if info.Key != "certificates" {
+		t.Fatalf("expected the directory key back, got %q", info.Key)
+	}
+
+	if !storage.Exists(ctx, "certificates") {
+		t.Fatal("a directory must exist")
+	}
+	if storage.Exists(ctx, "cert") {
+		t.Fatal("a string prefix of a directory must not exist")
 	}
 }
 

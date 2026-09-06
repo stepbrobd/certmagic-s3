@@ -572,16 +572,13 @@ func (s3 *S3) Delete(ctx context.Context, key string) error {
 		}
 	}
 
-	// certmagic deletes a directory by naming it, expecting everything below to
-	// go with it, removing the single object left expired ech configs and old
-	// certificate folders in the bucket forever
-	// the trailing separator keeps "a/b" from also matching "a/bc"
+	// a directory is deleted by name and everything below goes with it
 	listing := s3.client.ListObjects(ctx, s3.Bucket, minio.ListObjectsOptions{
-		Prefix:    prefixed + "/",
+		Prefix:    s3.dirPrefix(key),
 		Recursive: true,
 	})
 
-	below := make([]minio.ObjectInfo, 0)
+	var below []minio.ObjectInfo
 
 	for object := range listing {
 		if object.Err != nil {
@@ -589,10 +586,6 @@ func (s3 *S3) Delete(ctx context.Context, key string) error {
 		}
 
 		below = append(below, object)
-	}
-
-	if len(below) == 0 {
-		return nil
 	}
 
 	objects := make(chan minio.ObjectInfo, len(below))
@@ -611,25 +604,22 @@ func (s3 *S3) Delete(ctx context.Context, key string) error {
 }
 
 func (s3 *S3) Exists(ctx context.Context, key string) bool {
-	key = s3.KeyPrefix(key)
+	_, err := s3.Stat(ctx, key)
 
-	_, err := s3.client.StatObject(ctx, s3.Bucket, key, minio.StatObjectOptions{})
+	// certmagic treats a failed check as a missing key and asks the CA for a new certificate
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		s3.logger.Error("checking a key failed, reporting it missing", zap.String("key", key), zap.Error(err))
+	}
 
-	exists := err == nil
-
-	s3.logger.Debug("checking", zap.String("key", key), zap.Bool("exists", exists))
-
-	return exists
+	return err == nil
 }
 
 func (s3 *S3) List(ctx context.Context, prefix string, recursive bool) ([]string, error) {
 	objects := s3.client.ListObjects(ctx, s3.Bucket, minio.ListObjectsOptions{
-		Prefix:    s3.KeyPrefix(prefix),
+		Prefix:    s3.dirPrefix(prefix),
 		Recursive: recursive,
 	})
 
-	// len of a channel is its queue depth, sizing the slice with it prepended
-	// that many empty keys to every result
 	keys := make([]string, 0)
 
 	for object := range objects {
@@ -637,10 +627,11 @@ func (s3 *S3) List(ctx context.Context, prefix string, recursive bool) ([]string
 			return nil, object.Err
 		}
 
-		key := s3.CutKeyPrefix(object.Key)
+		// a non-recursive listing reports a directory with a trailing separator
+		key := s3.CutKeyPrefix(strings.TrimSuffix(object.Key, "/"))
 
 		// locks share the bucket but are bookkeeping, not stored data
-		if key == "" || strings.HasPrefix(key, lockPrefix+"/") {
+		if key == "" || key == lockPrefix || strings.HasPrefix(key, lockPrefix+"/") {
 			continue
 		}
 
@@ -654,30 +645,59 @@ func (s3 *S3) Stat(ctx context.Context, key string) (certmagic.KeyInfo, error) {
 	prefixed := s3.KeyPrefix(key)
 
 	object, err := s3.client.StatObject(ctx, s3.Bucket, prefixed, minio.StatObjectOptions{})
-	if err != nil {
-		// returning a nil error here reported every missing key as a zero sized
-		// one that exists, callers cannot tell the two apart
-		if minio.ToErrorResponse(err).Code == minio.NoSuchKey {
-			return certmagic.KeyInfo{}, fs.ErrNotExist
-		}
+	if err == nil {
+		s3.logger.Debug("stat", zap.String("key", prefixed), zap.Int64("bytes", object.Size))
 
+		return certmagic.KeyInfo{
+			Key:        key,
+			Modified:   object.LastModified,
+			Size:       object.Size,
+			IsTerminal: true,
+		}, nil
+	}
+	if !isNotExist(err) {
 		return certmagic.KeyInfo{}, err
 	}
 
-	s3.logger.Debug("stat", zap.String("key", prefixed), zap.Int64("bytes", object.Size))
+	// a key with no value of its own is a directory when other keys live below it
+	dir, err := s3.hasChildren(ctx, key)
+	if err != nil {
+		return certmagic.KeyInfo{}, err
+	}
+	if !dir {
+		return certmagic.KeyInfo{}, fs.ErrNotExist
+	}
 
-	return certmagic.KeyInfo{
-		// the caller asked with an unprefixed key and expects it back
-		Key:      key,
-		Modified: object.LastModified,
-		Size:     object.Size,
-		// terminal means the key holds a value rather than only other keys
-		IsTerminal: !strings.HasSuffix(prefixed, "/"),
-	}, nil
+	return certmagic.KeyInfo{Key: key}, nil
+}
+
+// hasChildren reports whether any key is stored below key
+func (s3 *S3) hasChildren(ctx context.Context, key string) (bool, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	for object := range s3.client.ListObjects(ctx, s3.Bucket, minio.ListObjectsOptions{
+		Prefix:    s3.dirPrefix(key),
+		Recursive: true,
+		MaxKeys:   1,
+	}) {
+		return object.Err == nil, object.Err
+	}
+
+	return false, nil
 }
 
 func (s3 *S3) KeyPrefix(key string) string {
 	return path.Join(s3.Prefix, key)
+}
+
+// dirPrefix is the listing prefix matching every key below key and no string sibling
+func (s3 *S3) dirPrefix(key string) string {
+	if prefixed := s3.KeyPrefix(key); prefixed != "" {
+		return prefixed + "/"
+	}
+
+	return ""
 }
 func (s3 *S3) CutKeyPrefix(key string) string {
 	cut, _ := strings.CutPrefix(key, s3.Prefix)
