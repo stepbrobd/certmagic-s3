@@ -1,8 +1,7 @@
-
 .PHONY: build run
 
 build:
-	xcaddy build --with github.com/caddy-dns/cloudflare --with github.com/stepbrobd/certmagic-s3=.
+	xcaddy build --with github.com/stepbrobd/certmagic-s3=.
 
 run:
-	./caddy run --config ./Caddyfile
+	./caddy run --config ./caddyfile

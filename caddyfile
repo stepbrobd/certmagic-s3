@@ -1,0 +1,14 @@
+{
+	storage s3 {
+		host {$S3_HOST}
+		bucket {$S3_BUCKET}
+		access_id {$S3_ACCESS_ID}
+		secret_key {$S3_SECRET_KEY}
+		prefix {$S3_PREFIX:caddy}
+		insecure {$S3_INSECURE:false}
+	}
+}
+
+localhost {
+	respond "ok"
+}
