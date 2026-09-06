@@ -86,6 +86,10 @@ type S3 struct {
 	logger *zap.Logger
 	client *minio.Client
 
+	// one holder per name in this process, taken before the s3 protocol so
+	// every Unlock pairs with its own Lock
+	gates map[string]chan struct{}
+
 	// locks currently owned by this instance, keyed by lock object key
 	locks   map[string]*heldLock
 	locksMu sync.Mutex
@@ -238,6 +242,7 @@ func (s3 *S3) Provision(ctx caddy.Context) error {
 	}
 
 	s3.client = client
+	s3.gates = make(map[string]chan struct{})
 	s3.locks = make(map[string]*heldLock)
 
 	return nil
@@ -265,9 +270,21 @@ func (s3 *S3) Lock(ctx context.Context, name string) error {
 		return err
 	}
 
-	return s3.retry(ctx, key, "acquiring lock", func() (bool, error) {
+	gate := s3.gate(key)
+	select {
+	case gate <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+
+	err = s3.retry(ctx, key, "acquiring lock", func() (bool, error) {
 		return s3.acquire(ctx, key, owner)
 	})
+	if err != nil {
+		<-gate
+	}
+
+	return err
 }
 
 // Unlock stops refreshing the named lock and marks it released
@@ -285,6 +302,7 @@ func (s3 *S3) Unlock(ctx context.Context, name string) error {
 		s3.logger.Debug("unlock of a lock not held here, leaving it to expire", zap.String("key", key))
 		return nil
 	}
+	defer func() { <-s3.gate(key) }()
 
 	// no refresh may land after the version the release replaces was read
 	held.cancel()
@@ -448,13 +466,24 @@ func (s3 *S3) trackLock(ctx context.Context, key string, claim lockInfo, etag st
 	held := &heldLock{owner: claim.Owner, created: claim.Created, etag: etag, cancel: cancel, done: make(chan struct{})}
 
 	s3.locksMu.Lock()
-	if previous, ok := s3.locks[key]; ok {
-		previous.cancel()
-	}
 	s3.locks[key] = held
 	s3.locksMu.Unlock()
 
 	go s3.keepLockFresh(refresh, key, held)
+}
+
+// gate returns the in-process semaphore of a lock key
+func (s3 *S3) gate(key string) chan struct{} {
+	s3.locksMu.Lock()
+	defer s3.locksMu.Unlock()
+
+	gate, ok := s3.gates[key]
+	if !ok {
+		gate = make(chan struct{}, 1)
+		s3.gates[key] = gate
+	}
+
+	return gate
 }
 
 // keepLockFresh rewrites the lock while this instance owns it, so a live

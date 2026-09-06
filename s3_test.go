@@ -54,6 +54,7 @@ func newTestStorage(t *testing.T, prefix string) *S3 {
 	return &S3{
 		logger: zap.NewNop(),
 		client: client,
+		gates:  make(map[string]chan struct{}),
 		locks:  make(map[string]*heldLock),
 		Bucket: bucket,
 		Prefix: prefix,
