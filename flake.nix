@@ -2,14 +2,8 @@
   outputs = inputs: inputs.parts.lib.mkFlake { inherit inputs; } {
     systems = import inputs.systems;
 
-    perSystem = { lib, pkgs, system, self', ... }: {
-      _module.args = lib.fix (self: {
-        lib = with inputs; builtins // nixpkgs.lib // parts.lib;
-        pkgs = import inputs.nixpkgs { inherit system; };
-      });
-
+    perSystem = { lib, pkgs, ... }: {
       devShells.default = pkgs.mkShell {
-        inputsFrom = lib.attrValues self'.packages;
         packages = with pkgs; [
           deno
           nixpkgs-fmt
@@ -47,6 +41,4 @@
   inputs.systems.url = "github:nix-systems/default";
   inputs.parts.url = "github:hercules-ci/flake-parts";
   inputs.parts.inputs.nixpkgs-lib.follows = "nixpkgs";
-  inputs.utils.url = "github:numtide/flake-utils";
-  inputs.utils.inputs.systems.follows = "systems";
 }
