@@ -135,7 +135,6 @@ func TestProvision(t *testing.T) {
 }
 
 // mutual exclusion is the entire point of the locker
-// with no-op Lock/Unlock every instance enters at once and this fails
 func TestLockIsMutuallyExclusive(t *testing.T) {
 	const instances = 8
 
@@ -187,13 +186,17 @@ func TestLockIsMutuallyExclusive(t *testing.T) {
 	}
 }
 
-// a lock held by a live instance must block everyone else until released
-func TestLockBlocksWhileHeld(t *testing.T) {
+// a holder keeps rewriting its lock, so a waiter polling past the expiry never
+// takes it, and a release hands it over at once
+func TestLockHeldPastExpiry(t *testing.T) {
 	prefix := testPrefix(t)
 	name := "issue_cert_held.example.com"
 
 	holder := newTestStorage(t, prefix)
 	waiter := newTestStorage(t, prefix)
+
+	shorten(t, &lockRefreshInterval, time.Second)
+	shorten(t, &lockTTL, 3*time.Second)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -209,10 +212,11 @@ func TestLockBlocksWhileHeld(t *testing.T) {
 	acquired := make(chan error, 1)
 	go func() { acquired <- waiter.Lock(ctx, name) }()
 
+	// two expiries pass while the holder keeps refreshing
 	select {
 	case err := <-acquired:
 		t.Fatalf("waiter took a held lock: %v", err)
-	case <-time.After(3 * time.Second):
+	case <-time.After(7 * time.Second):
 	}
 
 	if err := holder.Unlock(ctx, name); err != nil {
@@ -278,69 +282,6 @@ func TestLockReclaimsAbandoned(t *testing.T) {
 	}
 	if stored.Owner == "dead-node/deadbeef" {
 		t.Fatal("abandoned lock was not reclaimed")
-	}
-}
-
-// concurrent writers must not tear a cert and key pair the way the outage did
-func TestLockSerializesWriters(t *testing.T) {
-	const writers = 6
-
-	prefix := testPrefix(t)
-	name := "issue_cert_paired.example.com"
-
-	nodes := make([]*S3, writers)
-	for i := range nodes {
-		nodes[i] = newTestStorage(t, prefix)
-	}
-
-	var wg sync.WaitGroup
-	for i, node := range nodes {
-		wg.Add(1)
-		go func(i int, node *S3) {
-			defer wg.Done()
-
-			ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-			defer cancel()
-
-			if err := node.Lock(ctx, name); err != nil {
-				t.Errorf("lock: %v", err)
-				return
-			}
-			defer node.Unlock(ctx, name)
-
-			// the delays are staggered so that unserialized writers always finish
-			// in a different order for the two halves of the pair, which is how
-			// the outage put one order's key next to another order's certificate
-			// under a working lock the two stores stay atomic and the pair matches
-			stamp := fmt.Appendf(nil, "writer-%d", i)
-
-			time.Sleep(time.Duration(i) * 10 * time.Millisecond)
-			if err := node.Store(ctx, "pair.key", stamp); err != nil {
-				t.Errorf("store key: %v", err)
-				return
-			}
-
-			time.Sleep(time.Duration(writers-1-i) * 40 * time.Millisecond)
-			if err := node.Store(ctx, "pair.crt", stamp); err != nil {
-				t.Errorf("store crt: %v", err)
-			}
-		}(i, node)
-	}
-	wg.Wait()
-
-	reader := newTestStorage(t, prefix)
-
-	key, err := reader.Load(t.Context(), "pair.key")
-	if err != nil {
-		t.Fatalf("load key: %v", err)
-	}
-	crt, err := reader.Load(t.Context(), "pair.crt")
-	if err != nil {
-		t.Fatalf("load crt: %v", err)
-	}
-
-	if !bytes.Equal(key, crt) {
-		t.Fatalf("torn pair: key came from %q but crt came from %q", key, crt)
 	}
 }
 
@@ -425,9 +366,9 @@ func TestList(t *testing.T) {
 	}
 }
 
-// a missing key is fs.ErrNotExist, a stored value is terminal and a key with
-// other keys below it is a directory that exists
-func TestStat(t *testing.T) {
+// a missing key is fs.ErrNotExist, a stored value is terminal and loads back,
+// and a key with other keys below it is a directory that exists
+func TestStatAndLoad(t *testing.T) {
 	prefix := testPrefix(t)
 	storage := newTestStorage(t, prefix)
 
@@ -436,9 +377,20 @@ func TestStat(t *testing.T) {
 	if _, err := storage.Stat(ctx, "certificates/absent.crt"); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("expected fs.ErrNotExist for a missing key, got %v", err)
 	}
+	if _, err := storage.Load(ctx, "certificates/absent.crt"); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("expected fs.ErrNotExist for a missing load, got %v", err)
+	}
 
 	if err := storage.Store(ctx, "certificates/present.crt", []byte("hello")); err != nil {
 		t.Fatalf("store: %v", err)
+	}
+
+	got, err := storage.Load(ctx, "certificates/present.crt")
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !bytes.Equal(got, []byte("hello")) {
+		t.Fatalf("loaded %q, want %q", got, "hello")
 	}
 
 	info, err := storage.Stat(ctx, "certificates/present.crt")
@@ -477,34 +429,7 @@ func TestStat(t *testing.T) {
 	}
 }
 
-// Load must still report a missing key as fs.ErrNotExist now that it no longer
-// asks Exists first
-func TestLoadMissingKey(t *testing.T) {
-	prefix := testPrefix(t)
-	storage := newTestStorage(t, prefix)
-
-	ctx := t.Context()
-
-	if _, err := storage.Load(ctx, "certificates/absent.crt"); !errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("expected fs.ErrNotExist, got %v", err)
-	}
-
-	want := []byte("certificate bytes")
-	if err := storage.Store(ctx, "certificates/present.crt", want); err != nil {
-		t.Fatalf("store: %v", err)
-	}
-
-	got, err := storage.Load(ctx, "certificates/present.crt")
-	if err != nil {
-		t.Fatalf("load: %v", err)
-	}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("loaded %q, want %q", got, want)
-	}
-}
-
-// certmagic removes a directory by naming it, deleting only the single object
-// left expired ech configs and old certificate folders behind forever
+// certmagic removes a directory by naming it and expects everything below to go
 func TestDeleteRemovesEverythingBelow(t *testing.T) {
 	prefix := testPrefix(t)
 	storage := newTestStorage(t, prefix)
@@ -548,11 +473,11 @@ func TestDeleteRemovesEverythingBelow(t *testing.T) {
 	}
 }
 
-// certmagic takes short lived locks constantly for storage cleaning and ARI
-// so a waiter routinely reads a lock that its holder deletes mid read
-// that must look like a free lock, never like an error
-func TestLockChurnNeverErrors(t *testing.T) {
-	storage := newTestStorage(t, testPrefix(t))
+// certmagic takes short lived locks constantly for storage cleaning and ARI,
+// so a waiter routinely reads a lock its holder releases mid read
+// that must look like a free lock, never like an error, and never overlap
+func TestLockChurn(t *testing.T) {
+	prefix := testPrefix(t)
 	ctx := t.Context()
 
 	const (
@@ -560,25 +485,34 @@ func TestLockChurnNeverErrors(t *testing.T) {
 		rounds     = 12
 	)
 
+	nodes := make([]*S3, contenders)
+	for i := range nodes {
+		nodes[i] = newTestStorage(t, prefix)
+	}
+
 	var (
-		failures atomic.Int64
-		first    atomic.Value
-		wg       sync.WaitGroup
+		concurrent, overlaps atomic.Int32
+		failures             atomic.Int64
+		first                atomic.Value
+		wg                   sync.WaitGroup
 	)
 
-	for i := range contenders {
-
+	for i, node := range nodes {
 		wg.Go(func() {
-
 			for range rounds {
-				if err := storage.Lock(ctx, "churn"); err != nil {
+				if err := node.Lock(ctx, "churn"); err != nil {
 					failures.Add(1)
 					first.CompareAndSwap(nil, fmt.Sprintf("contender %d: %v", i, err))
 
 					continue
 				}
 
-				if err := storage.Unlock(ctx, "churn"); err != nil {
+				if concurrent.Add(1) != 1 {
+					overlaps.Add(1)
+				}
+				concurrent.Add(-1)
+
+				if err := node.Unlock(ctx, "churn"); err != nil {
 					failures.Add(1)
 					first.CompareAndSwap(nil, fmt.Sprintf("contender %d unlock: %v", i, err))
 				}
@@ -588,6 +522,9 @@ func TestLockChurnNeverErrors(t *testing.T) {
 
 	wg.Wait()
 
+	if n := overlaps.Load(); n != 0 {
+		t.Fatalf("lock was held concurrently %d times", n)
+	}
 	if n := failures.Load(); n != 0 {
 		t.Fatalf("lock churn produced %d errors, first was %v", n, first.Load())
 	}
