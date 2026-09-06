@@ -616,8 +616,11 @@ func wait(ctx context.Context, d time.Duration) error {
 }
 
 // minio only translates NoSuchKey on some paths so every read has to test it
+// a bare 404 counts too, a head carries no body to name the code
 func isNotExist(err error) bool {
-	return minio.ToErrorResponse(err).Code == minio.NoSuchKey
+	response := minio.ToErrorResponse(err)
+
+	return response.Code == minio.NoSuchKey || response.StatusCode == http.StatusNotFound
 }
 
 // a conditional put that lost its race answers 412
@@ -644,8 +647,6 @@ func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
 
 	s3.logger.Debug("loading", zap.String("key", prefixed))
 
-	// a preceding Exists call cost a second round trip and still raced, the key
-	// could vanish between the check and the read
 	object, err := s3.client.GetObject(ctx, s3.Bucket, prefixed, minio.GetObjectOptions{})
 	if err != nil {
 		return nil, err
@@ -655,7 +656,7 @@ func (s3 *S3) Load(ctx context.Context, key string) ([]byte, error) {
 
 	body, err := io.ReadAll(object)
 	if err != nil {
-		if minio.ToErrorResponse(err).Code == minio.NoSuchKey {
+		if isNotExist(err) {
 			return nil, fs.ErrNotExist
 		}
 
@@ -670,10 +671,8 @@ func (s3 *S3) Delete(ctx context.Context, key string) error {
 
 	s3.logger.Debug("deleting", zap.String("key", prefixed))
 
-	if err := s3.client.RemoveObject(ctx, s3.Bucket, prefixed, minio.RemoveObjectOptions{}); err != nil {
-		if minio.ToErrorResponse(err).Code != minio.NoSuchKey {
-			return err
-		}
+	if err := s3.client.RemoveObject(ctx, s3.Bucket, prefixed, minio.RemoveObjectOptions{}); err != nil && !isNotExist(err) {
+		return err
 	}
 
 	// a directory is deleted by name and everything below goes with it
@@ -803,11 +802,12 @@ func (s3 *S3) dirPrefix(key string) string {
 
 	return ""
 }
+
+// CutKeyPrefix returns a key the way it was stored, without the prefix or the
+// separator joining them
 func (s3 *S3) CutKeyPrefix(key string) string {
 	cut, _ := strings.CutPrefix(key, s3.Prefix)
 
-	// without trimming the separator a configured prefix yields "/a/b" while an
-	// empty one yields "a/b" for the same object
 	return strings.TrimPrefix(cut, "/")
 }
 
