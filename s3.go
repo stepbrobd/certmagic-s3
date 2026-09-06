@@ -401,7 +401,9 @@ func (s3 *S3) loadLock(ctx context.Context, key string) (lockInfo, string, error
 	}
 	defer object.Close()
 
-	stat, err := object.Stat()
+	// reading first keeps this to one request, a stat before the read makes
+	// minio-go condition the read on the etag it saw and fail once the lock moves
+	body, err := io.ReadAll(object)
 	if err != nil {
 		if isNotExist(err) {
 			return stored, "", fs.ErrNotExist
@@ -409,12 +411,8 @@ func (s3 *S3) loadLock(ctx context.Context, key string) (lockInfo, string, error
 		return stored, "", err
 	}
 
-	body, err := io.ReadAll(object)
+	stat, err := object.Stat()
 	if err != nil {
-		// the holder can release between the stat and this read
-		if isNotExist(err) {
-			return stored, "", fs.ErrNotExist
-		}
 		return stored, "", err
 	}
 
