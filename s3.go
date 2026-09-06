@@ -462,8 +462,12 @@ func (s3 *S3) trackLock(ctx context.Context, key string, claim lockInfo, etag st
 func (s3 *S3) keepLockFresh(ctx context.Context, key string, held *heldLock) {
 	defer close(held.done)
 
+	// a failed write is retried at the poll interval so a short outage does not
+	// eat the whole margin between two refreshes
+	interval := lockRefreshInterval
+
 	for {
-		if err := wait(ctx, lockRefreshInterval); err != nil {
+		if err := wait(ctx, interval); err != nil {
 			return
 		}
 
@@ -472,6 +476,7 @@ func (s3 *S3) keepLockFresh(ctx context.Context, key string, held *heldLock) {
 		etag, err := s3.writeLock(ctx, key, fresh, held.etag)
 		if err == nil {
 			held.etag = etag
+			interval = lockRefreshInterval
 			continue
 		}
 		// the swap fails only once the lock was reclaimed or removed
@@ -480,6 +485,7 @@ func (s3 *S3) keepLockFresh(ctx context.Context, key string, held *heldLock) {
 			return
 		}
 		s3.logger.Warn("extending a held lock failed, retrying", zap.String("key", key), zap.Error(err))
+		interval = lockPollInterval
 	}
 }
 
