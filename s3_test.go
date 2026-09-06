@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/caddyserver/caddy/v2"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"go.uber.org/zap"
@@ -64,6 +65,35 @@ func newTestStorage(t *testing.T, prefix string) *S3 {
 func testPrefix(t *testing.T) string {
 	t.Helper()
 	return fmt.Sprintf("certmagic-test/%s-%d", t.Name(), time.Now().UnixNano())
+}
+
+// Provision trims the prefix and proves the backend honors conditional writes
+// before any lock depends on them
+func TestProvision(t *testing.T) {
+	prefix := testPrefix(t)
+	backend := newTestStorage(t, prefix)
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: t.Context()})
+	defer cancel()
+
+	storage := &S3{
+		Host:      envOr("S3_TEST_HOST", ""),
+		Bucket:    backend.Bucket,
+		AccessID:  envOr("S3_TEST_ACCESS_ID", ""),
+		SecretKey: envOr("S3_TEST_SECRET_KEY", ""),
+		Prefix:    "/" + prefix + "/",
+		Insecure:  envOr("S3_TEST_INSECURE", "") != "",
+	}
+	if err := storage.Provision(ctx); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+
+	if storage.Prefix != prefix {
+		t.Fatalf("prefix %q was not trimmed, got %q", "/"+prefix+"/", storage.Prefix)
+	}
+	if storage.Exists(t.Context(), lockPrefix) {
+		t.Fatal("the probe object was left behind")
+	}
 }
 
 // mutual exclusion is the entire point of the locker

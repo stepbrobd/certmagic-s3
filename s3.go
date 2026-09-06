@@ -246,7 +246,47 @@ func (s3 *S3) Provision(ctx caddy.Context) error {
 	s3.gates = make(map[string]chan struct{})
 	s3.locks = make(map[string]*heldLock)
 
+	return s3.verifyConditionalWrites(ctx)
+}
+
+// verifyConditionalWrites fails when the backend accepts a conditional put it
+// had to refuse, since locks would then exclude nobody
+func (s3 *S3) verifyConditionalWrites(ctx context.Context) error {
+	owner, err := newLockOwner()
+	if err != nil {
+		return err
+	}
+
+	key := s3.lockKey("probe-" + path.Base(owner))
+	probe := lockInfo{Owner: owner, Created: time.Now()}
+
+	etag, err := s3.writeLock(ctx, key, probe, "")
+	if err != nil {
+		return fmt.Errorf("writing a probe object to bucket %s: %w", s3.Bucket, err)
+	}
+	defer func() {
+		if err := s3.client.RemoveObject(context.WithoutCancel(ctx), s3.Bucket, key, minio.RemoveObjectOptions{}); err != nil {
+			s3.logger.Warn("removing the probe object failed", zap.String("key", key), zap.Error(err))
+		}
+	}()
+
+	if _, err := s3.writeLock(ctx, key, probe, ""); !isPreconditionFailed(err) {
+		return conditionalWriteError("a create of an existing object", err)
+	}
+	if _, err := s3.writeLock(ctx, key, probe, strings.Repeat("0", len(etag))); !isPreconditionFailed(err) {
+		return conditionalWriteError("a replace with a wrong etag", err)
+	}
+
 	return nil
+}
+
+// conditionalWriteError describes a probe the backend had to refuse with a 412
+func conditionalWriteError(what string, err error) error {
+	if err == nil {
+		return fmt.Errorf("the backend accepted %s, it does not honor conditional writes and locks would exclude nobody", what)
+	}
+
+	return fmt.Errorf("the backend answered %s with %w instead of a 412", what, err)
 }
 
 func (*S3) CaddyModule() caddy.ModuleInfo {
