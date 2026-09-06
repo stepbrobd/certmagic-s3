@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"go.uber.org/zap"
@@ -65,6 +66,43 @@ func newTestStorage(t *testing.T, prefix string) *S3 {
 func testPrefix(t *testing.T) string {
 	t.Helper()
 	return fmt.Sprintf("certmagic-test/%s-%d", t.Name(), time.Now().UnixNano())
+}
+
+// the block is parsed by the dispenser, so a typo, a missing or a stray
+// argument is an error at adapt time rather than a silent fallback
+func TestUnmarshalCaddyfile(t *testing.T) {
+	var storage S3
+
+	err := storage.UnmarshalCaddyfile(caddyfile.NewTestDispenser(`s3 {
+		host s3.example.com:9000
+		bucket certs
+		access_id id
+		secret_key secret
+		prefix caddy
+		insecure true
+		use_iam_provider false
+	}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+
+	got := []any{storage.Host, storage.Bucket, storage.AccessID, storage.SecretKey, storage.Prefix, storage.Insecure, storage.UseIamProvider}
+	want := []any{"s3.example.com:9000", "certs", "id", "secret", "caddy", true, false}
+	if !slices.Equal(got, want) {
+		t.Fatalf("parsed %v, want %v", got, want)
+	}
+
+	for _, bad := range []string{
+		"s3 {\n\tacess_id id\n}",
+		"s3 {\n\tbucket\n}",
+		"s3 {\n\tbucket a b\n}",
+		"s3 {\n\tinsecure maybe\n}",
+		"s3 extra {\n\tbucket certs\n}",
+	} {
+		if err := new(S3).UnmarshalCaddyfile(caddyfile.NewTestDispenser(bad)); err == nil {
+			t.Errorf("%q parsed without an error", bad)
+		}
+	}
 }
 
 // Provision trims the prefix and proves the backend honors conditional writes

@@ -106,26 +106,31 @@ type S3 struct {
 }
 
 func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
-	// the string fields are replaced in Provision, but these are parsed here and
-	// a placeholder has to resolve before it reaches strconv
+	// the string fields are replaced in Provision, a placeholder in a boolean
+	// has to resolve before it reaches strconv
 	repl := caddy.NewReplacer()
 
-	for d.Next() {
+	if !d.Next() {
+		return d.Err("expected tokens")
+	}
+	if d.NextArg() {
+		return d.ArgErr()
+	}
 
+	for d.NextBlock(0) {
 		key := d.Val()
 
-		var value string
-		if !d.Args(&value) {
-			continue
+		if !d.NextArg() {
+			return d.ArgErr()
+		}
+		value := d.Val()
+		if d.NextArg() {
+			return d.ArgErr()
 		}
 
 		switch key {
 		case "host":
 			s3.Host = value
-			err := validateHost(s3.Host)
-			if err != nil {
-				return d.Err("Invalid usage of host in s3-storage config: " + err.Error())
-			}
 		case "bucket":
 			s3.Bucket = value
 		case "access_id":
@@ -134,20 +139,19 @@ func (s3 *S3) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			s3.SecretKey = value
 		case "prefix":
 			s3.Prefix = value
-		case "insecure":
-			insecure, err := strconv.ParseBool(repl.ReplaceKnown(value, ""))
+		case "insecure", "use_iam_provider":
+			flag, err := strconv.ParseBool(repl.ReplaceKnown(value, ""))
 			if err != nil {
-				return d.Err("Invalid usage of insecure in s3-storage config: " + err.Error())
+				return d.Errf("%s: %v", key, err)
 			}
-			s3.Insecure = insecure
-		case "use_iam_provider":
-			boolValue, err := strconv.ParseBool(repl.ReplaceKnown(value, ""))
-			if err != nil {
-				return d.Err("Invalid usage of use_iam_provider in s3-storage config: " + err.Error())
+			if key == "insecure" {
+				s3.Insecure = flag
+			} else {
+				s3.UseIamProvider = flag
 			}
-			s3.UseIamProvider = boolValue
+		default:
+			return d.Errf("unrecognized subdirective %s", key)
 		}
-
 	}
 
 	return nil
