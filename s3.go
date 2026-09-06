@@ -179,12 +179,10 @@ func (s3 *S3) Provision(ctx caddy.Context) error {
 	}
 
 	if !s3.UseIamProvider {
-		boolVal := os.Getenv("S3_USE_IAM_PROVIDER")
-		if boolVal != "" {
-			s3.UseIamProvider, err = strconv.ParseBool(boolVal)
-
+		if value := os.Getenv("S3_USE_IAM_PROVIDER"); value != "" {
+			s3.UseIamProvider, err = strconv.ParseBool(value)
 			if err != nil {
-				s3.UseIamProvider = false // default value
+				return fmt.Errorf("S3_USE_IAM_PROVIDER: %w", err)
 			}
 		}
 	}
@@ -217,16 +215,13 @@ func (s3 *S3) Provision(ctx caddy.Context) error {
 	s3.Prefix = strings.Trim(s3.Prefix, "/")
 
 	if !s3.Insecure {
-		insecure := os.Getenv("S3_INSECURE")
-		if insecure != "" {
-			s3.Insecure, err = strconv.ParseBool(insecure)
-
+		if value := os.Getenv("S3_INSECURE"); value != "" {
+			s3.Insecure, err = strconv.ParseBool(value)
 			if err != nil {
-				s3.Insecure = false // default value
+				return fmt.Errorf("S3_INSECURE: %w", err)
 			}
 		}
 	}
-	secure := !s3.Insecure
 
 	var creds *credentials.Credentials
 	if s3.UseIamProvider {
@@ -240,7 +235,7 @@ func (s3 *S3) Provision(ctx caddy.Context) error {
 	// S3 Client
 	client, err := minio.New(s3.Host, &minio.Options{
 		Creds:  creds,
-		Secure: secure,
+		Secure: !s3.Insecure,
 	})
 	if err != nil {
 		return err
