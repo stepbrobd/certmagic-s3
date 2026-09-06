@@ -293,6 +293,12 @@ func (s3 *S3) Lock(ctx context.Context, name string) error {
 			continue
 		}
 
+		if existing.Owner == owner {
+			// the create went through and only its response was lost
+			s3.trackLock(ctx, key, owner)
+			return nil
+		}
+
 		if time.Now().Before(existing.Expires) {
 			if waitErr := wait(ctx, lockPollInterval); waitErr != nil {
 				return waitErr
