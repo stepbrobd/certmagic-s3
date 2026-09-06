@@ -41,29 +41,41 @@ const (
 	// locks live under their own prefix so List never mixes them into data results
 	lockPrefix = "locks"
 
-	// a lock whose holder stopped extending it becomes reclaimable after this
+	// how many transient s3 failures to absorb before failing an acquisition or a release
+	lockRetryLimit = 5
+)
+
+// the tests shrink these to run in seconds
+var (
+	// a lock whose last write is older than this is stale and may be reclaimed
 	lockTTL = time.Minute
 
-	// how often a holder extends the lock it owns
+	// how often a holder rewrites the lock it owns
 	lockRefreshInterval = 15 * time.Second
 
 	// how often a waiter retries acquisition
 	lockPollInterval = time.Second
-	// how many transient s3 failures to absorb before failing an acquisition
-	lockRetryLimit = 5
 )
 
 // lockInfo is the body of a lock object
+// staleness is judged from the object's last write on the server, no holder
+// clock enters the protocol
 type lockInfo struct {
-	Owner   string    `json:"owner"`
-	Created time.Time `json:"created"`
-	Expires time.Time `json:"expires"`
+	Owner     string    `json:"owner"`
+	Created   time.Time `json:"created"`
+	Refreshed time.Time `json:"refreshed,omitzero"`
+	Released  bool      `json:"released,omitempty"`
 }
 
-// heldLock is a lock this instance owns, cancel stops the refresher
+// heldLock is a lock this instance owns
+// etag is the version its last write produced, the refresher owns it until
+// done is closed and a release replaces exactly that version
 type heldLock struct {
-	owner  string
-	cancel context.CancelFunc
+	owner   string
+	created time.Time
+	etag    string
+	cancel  context.CancelFunc
+	done    chan struct{}
 }
 
 func init() {
@@ -245,10 +257,6 @@ func (s3 *S3) CertMagicStorage() (certmagic.Storage, error) {
 }
 
 // Lock blocks until this instance owns the named lock or ctx ends
-// the create is conditional on the object not existing, so concurrent
-// instances cannot all believe they hold it
-// a lock whose holder stopped extending it past its expiry is reclaimed by
-// exactly one waiter
 func (s3 *S3) Lock(ctx context.Context, name string) error {
 	key := s3.lockKey(name)
 
@@ -257,84 +265,19 @@ func (s3 *S3) Lock(ctx context.Context, name string) error {
 		return err
 	}
 
-	// a hiccup talking to s3 must not fail issuance, a persistent fault must
-	transient := 0
-	retry := func(cause error) error {
-		transient++
-		if transient > lockRetryLimit {
-			return cause
-		}
-		s3.logger.Warn("acquiring lock failed, retrying", zap.String("key", key), zap.Error(cause))
-		return wait(ctx, lockPollInterval)
-	}
-
-	for {
-		createErr := s3.createLock(ctx, key, owner)
-		if createErr == nil {
-			s3.trackLock(ctx, key, owner)
-			return nil
-		}
-		if !isPreconditionFailed(createErr) {
-			if err := retry(createErr); err != nil {
-				return err
-			}
-			continue
-		}
-
-		existing, etag, loadErr := s3.loadLock(ctx, key)
-		if errors.Is(loadErr, fs.ErrNotExist) {
-			// released between the create and this read, retry at once
-			continue
-		}
-		if loadErr != nil {
-			if err := retry(loadErr); err != nil {
-				return err
-			}
-			continue
-		}
-
-		if existing.Owner == owner {
-			// the create went through and only its response was lost
-			s3.trackLock(ctx, key, owner)
-			return nil
-		}
-
-		if time.Now().Before(existing.Expires) {
-			if waitErr := wait(ctx, lockPollInterval); waitErr != nil {
-				return waitErr
-			}
-			continue
-		}
-
-		s3.logger.Warn("reclaiming an abandoned lock", zap.String("key", key), zap.String("owner", existing.Owner))
-
-		// swapping on the etag keeps two waiters from both reclaiming it
-		replaceErr := s3.replaceLock(ctx, key, owner, etag)
-		if replaceErr == nil {
-			s3.trackLock(ctx, key, owner)
-			return nil
-		}
-		if !isPreconditionFailed(replaceErr) {
-			if err := retry(replaceErr); err != nil {
-				return err
-			}
-			continue
-		}
-
-		if waitErr := wait(ctx, lockPollInterval); waitErr != nil {
-			return waitErr
-		}
-	}
+	return s3.retry(ctx, key, "acquiring lock", func() (bool, error) {
+		return s3.acquire(ctx, key, owner)
+	})
 }
 
-// Unlock stops extending the named lock and removes it
-// a lock this instance no longer owns is left for its expiry to clear so a
-// late Unlock cannot release someone else
+// Unlock stops refreshing the named lock and marks it released
+// the release replaces exactly the version this instance last wrote, so a
+// lock that went stale and was reclaimed meanwhile stays with its new holder
 func (s3 *S3) Unlock(ctx context.Context, name string) error {
 	key := s3.lockKey(name)
 
 	s3.locksMu.Lock()
-	current, mine := s3.locks[key]
+	held, mine := s3.locks[key]
 	delete(s3.locks, key)
 	s3.locksMu.Unlock()
 
@@ -343,67 +286,130 @@ func (s3 *S3) Unlock(ctx context.Context, name string) error {
 		return nil
 	}
 
-	current.cancel()
+	// no refresh may land after the version the release replaces was read
+	held.cancel()
+	<-held.done
 
-	existing, _, err := s3.loadLock(ctx, key)
-	if errors.Is(err, fs.ErrNotExist) {
-		return nil
+	release := lockInfo{Owner: held.owner, Created: held.created, Released: true}
+
+	return s3.retry(ctx, key, "releasing lock", func() (bool, error) {
+		_, err := s3.writeLock(ctx, key, release, held.etag)
+		switch {
+		case err == nil, isNotExist(err):
+			return true, nil
+		case isPreconditionFailed(err):
+			s3.logger.Warn("lock was reclaimed, leaving it", zap.String("key", key))
+			return true, nil
+		}
+		return false, err
+	})
+}
+
+// acquire makes one attempt at the lock
+// false with a nil error means a live holder has it
+func (s3 *S3) acquire(ctx context.Context, key, owner string) (bool, error) {
+	claim := lockInfo{Owner: owner, Created: time.Now()}
+
+	etag, err := s3.writeLock(ctx, key, claim, "")
+	if err == nil {
+		s3.trackLock(ctx, key, claim, etag)
+		return true, nil
 	}
+	if !isPreconditionFailed(err) {
+		return false, err
+	}
+
+	existing, stat, err := s3.loadLock(ctx, key)
 	if err != nil {
-		return err
+		// released between the create and this read, the next attempt creates it
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
 	}
 
-	if existing.Owner != current.owner {
-		s3.logger.Warn("lock was reclaimed, leaving it", zap.String("key", key), zap.String("owner", existing.Owner))
-		return nil
+	if existing.Owner == owner {
+		// the create went through and only its response was lost
+		s3.trackLock(ctx, key, claim, stat.ETag)
+		return true, nil
 	}
 
-	return s3.client.RemoveObject(ctx, s3.Bucket, key, minio.RemoveObjectOptions{})
+	stale := time.Since(stat.LastModified) > lockTTL
+	if !existing.Released && !stale {
+		return false, nil
+	}
+	if stale {
+		s3.logger.Warn("reclaiming an abandoned lock", zap.String("key", key), zap.String("owner", existing.Owner), zap.Time("last_write", stat.LastModified))
+	}
+
+	// swapping on the etag lets exactly one waiter take a free lock
+	etag, err = s3.writeLock(ctx, key, claim, stat.ETag)
+	if err == nil {
+		s3.trackLock(ctx, key, claim, etag)
+		return true, nil
+	}
+	if isPreconditionFailed(err) {
+		return false, nil
+	}
+	return false, err
 }
 
-// createLock writes the lock only when no object exists at the key
-func (s3 *S3) createLock(ctx context.Context, key, owner string) error {
-	return s3.putLock(ctx, key, owner, func(opts *minio.PutObjectOptions) {
-		opts.SetMatchETagExcept("*")
-	})
+// retry runs attempt until it reports done, absorbing up to lockRetryLimit
+// transient failures and pausing a poll interval between attempts
+func (s3 *S3) retry(ctx context.Context, key, what string, attempt func() (bool, error)) error {
+	transient := 0
+
+	for {
+		done, err := attempt()
+		if done {
+			return err
+		}
+		if err != nil {
+			// a hiccup talking to s3 must not fail issuance, a persistent fault must
+			transient++
+			if transient > lockRetryLimit {
+				return err
+			}
+			s3.logger.Warn(what+" failed, retrying", zap.String("key", key), zap.Error(err))
+		}
+
+		if err := wait(ctx, lockPollInterval); err != nil {
+			return err
+		}
+	}
 }
 
-// replaceLock overwrites the lock only while it still carries the given etag
-func (s3 *S3) replaceLock(ctx context.Context, key, owner, etag string) error {
-	return s3.putLock(ctx, key, owner, func(opts *minio.PutObjectOptions) {
-		opts.SetMatchETag(etag)
-	})
-}
-
-func (s3 *S3) putLock(ctx context.Context, key, owner string, condition func(*minio.PutObjectOptions)) error {
-	now := time.Now()
-
-	body, err := json.Marshal(lockInfo{
-		Owner:   owner,
-		Created: now,
-		Expires: now.Add(lockTTL),
-	})
+// writeLock stores body at key and returns the version written
+// an empty etag creates the object only when none exists, otherwise exactly
+// the version carrying etag is replaced
+func (s3 *S3) writeLock(ctx context.Context, key string, body lockInfo, etag string) (string, error) {
+	encoded, err := json.Marshal(body)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	opts := minio.PutObjectOptions{ContentType: "application/json"}
-	condition(&opts)
+	if etag == "" {
+		opts.SetMatchETagExcept("*")
+	} else {
+		opts.SetMatchETag(etag)
+	}
 
-	_, err = s3.client.PutObject(ctx, s3.Bucket, key, bytes.NewReader(body), int64(len(body)), opts)
+	info, err := s3.client.PutObject(ctx, s3.Bucket, key, bytes.NewReader(encoded), int64(len(encoded)), opts)
+	if err != nil {
+		return "", err
+	}
 
-	return err
+	return info.ETag, nil
 }
 
-// loadLock returns the stored lock and the etag it must be swapped against
-// a body that cannot be parsed is reported as a zero lock so that it reads as
-// expired and gets reclaimed rather than blocking every waiter forever
-func (s3 *S3) loadLock(ctx context.Context, key string) (lockInfo, string, error) {
+// loadLock returns the stored lock and the object it was read from
+func (s3 *S3) loadLock(ctx context.Context, key string) (lockInfo, minio.ObjectInfo, error) {
 	var stored lockInfo
 
 	object, err := s3.client.GetObject(ctx, s3.Bucket, key, minio.GetObjectOptions{})
 	if err != nil {
-		return stored, "", err
+		return stored, minio.ObjectInfo{}, err
 	}
 	defer object.Close()
 
@@ -412,72 +418,65 @@ func (s3 *S3) loadLock(ctx context.Context, key string) (lockInfo, string, error
 	body, err := io.ReadAll(object)
 	if err != nil {
 		if isNotExist(err) {
-			return stored, "", fs.ErrNotExist
+			return stored, minio.ObjectInfo{}, fs.ErrNotExist
 		}
-		return stored, "", err
+		return stored, minio.ObjectInfo{}, err
 	}
 
 	stat, err := object.Stat()
 	if err != nil {
-		return stored, "", err
+		return stored, minio.ObjectInfo{}, err
 	}
 
+	// an unreadable body still ages out by its last write
 	if err := json.Unmarshal(body, &stored); err != nil {
-		s3.logger.Warn("lock is unreadable, treating it as expired", zap.String("key", key), zap.Error(err))
-		return lockInfo{}, stat.ETag, nil
+		s3.logger.Warn("lock is unreadable", zap.String("key", key), zap.Error(err))
+		return lockInfo{}, stat, nil
 	}
 
-	return stored, stat.ETag, nil
+	return stored, stat, nil
 }
 
-// trackLock records the lock and starts extending it until Unlock
-func (s3 *S3) trackLock(ctx context.Context, key, owner string) {
+// trackLock records the lock and starts rewriting it until Unlock
+func (s3 *S3) trackLock(ctx context.Context, key string, claim lockInfo, etag string) {
 	// the refresher has to outlive the caller context, Unlock is what stops it
 	refresh, cancel := context.WithCancel(context.WithoutCancel(ctx))
+
+	held := &heldLock{owner: claim.Owner, created: claim.Created, etag: etag, cancel: cancel, done: make(chan struct{})}
 
 	s3.locksMu.Lock()
 	if previous, ok := s3.locks[key]; ok {
 		previous.cancel()
 	}
-	s3.locks[key] = &heldLock{owner: owner, cancel: cancel}
+	s3.locks[key] = held
 	s3.locksMu.Unlock()
 
-	go s3.keepLockFresh(refresh, key, owner)
+	go s3.keepLockFresh(refresh, key, held)
 }
 
-// keepLockFresh extends the lock while this instance still owns it
-// without it every lock would look abandoned one TTL after acquisition
-func (s3 *S3) keepLockFresh(ctx context.Context, key, owner string) {
+// keepLockFresh rewrites the lock while this instance owns it, so a live
+// holder never looks stale, and records the version of every write
+func (s3 *S3) keepLockFresh(ctx context.Context, key string, held *heldLock) {
+	defer close(held.done)
+
 	for {
 		if err := wait(ctx, lockRefreshInterval); err != nil {
 			return
 		}
 
-		current, etag, err := s3.loadLock(ctx, key)
-		if err != nil {
-			// nothing is left to extend once the object is gone
-			if errors.Is(err, fs.ErrNotExist) {
-				return
-			}
-			// giving up here would let a lock we still hold expire under us
-			s3.logger.Warn("reading a held lock failed, retrying", zap.String("key", key), zap.Error(err))
+		fresh := lockInfo{Owner: held.owner, Created: held.created, Refreshed: time.Now()}
+
+		etag, err := s3.writeLock(ctx, key, fresh, held.etag)
+		if err == nil {
+			held.etag = etag
 			continue
 		}
-
-		if current.Owner != owner {
-			s3.logger.Warn("lock is held elsewhere, stopping refresh", zap.String("key", key), zap.String("owner", current.Owner))
+		// the swap fails only once the lock was reclaimed or removed
+		if isPreconditionFailed(err) || isNotExist(err) {
+			s3.logger.Warn("lock moved on, stopping refresh", zap.String("key", key), zap.Error(err))
 			return
 		}
-
-		if err := s3.replaceLock(ctx, key, owner, etag); err != nil {
-			// losing the swap means the lock moved on, anything else is transient
-			if isPreconditionFailed(err) {
-				s3.logger.Warn("lock changed under the refresh, stopping", zap.String("key", key))
-				return
-			}
-			s3.logger.Warn("extending a held lock failed, retrying", zap.String("key", key), zap.Error(err))
-			continue
-		}
+		s3.logger.Warn("extending a held lock failed, retrying", zap.String("key", key), zap.Error(err))
 	}
 }
 
@@ -496,7 +495,7 @@ func newLockOwner() (string, error) {
 
 	host, err := os.Hostname()
 	if err != nil {
-		host = "unknown"
+		return "", err
 	}
 
 	return host + "/" + hex.EncodeToString(buf), nil

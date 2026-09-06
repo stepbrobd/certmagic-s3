@@ -168,10 +168,12 @@ func TestLockReclaimsAbandoned(t *testing.T) {
 	storage := newTestStorage(t, prefix)
 	key := storage.lockKey(name)
 
+	// the seeded lock is stale once its write is older than the expiry
+	shorten(t, &lockTTL, 2*time.Second)
+
 	abandoned, err := json.Marshal(lockInfo{
 		Owner:   "dead-node/deadbeef",
 		Created: time.Now().Add(-2 * time.Hour),
-		Expires: time.Now().Add(-1 * time.Hour),
 	})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
@@ -260,6 +262,14 @@ func TestLockSerializesWriters(t *testing.T) {
 	if !bytes.Equal(key, crt) {
 		t.Fatalf("torn pair: key came from %q but crt came from %q", key, crt)
 	}
+}
+
+// shorten sets a lock interval for one test so it runs in seconds
+func shorten(t *testing.T, interval *time.Duration, d time.Duration) {
+	t.Helper()
+	previous := *interval
+	*interval = d
+	t.Cleanup(func() { *interval = previous })
 }
 
 // envOr keeps the test setup free of repeated os.Getenv noise
