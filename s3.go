@@ -514,14 +514,12 @@ func isNotExist(err error) bool {
 	return minio.ToErrorResponse(err).Code == minio.NoSuchKey
 }
 
-// a conditional put that lost the race answers 412, some backends answer 409
+// a conditional put that lost its race answers 412
+// a 409 is a concurrent request that has to be retried, not a lost race
 func isPreconditionFailed(err error) bool {
 	response := minio.ToErrorResponse(err)
 
-	return response.Code == minio.PreconditionFailed ||
-		response.Code == minio.Conflict ||
-		response.StatusCode == http.StatusPreconditionFailed ||
-		response.StatusCode == http.StatusConflict
+	return response.Code == minio.PreconditionFailed || response.StatusCode == http.StatusPreconditionFailed
 }
 
 func (s3 *S3) Store(ctx context.Context, key string, value []byte) error {
