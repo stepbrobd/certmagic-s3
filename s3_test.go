@@ -496,6 +496,115 @@ func TestReleasedLockTakenQuietly(t *testing.T) {
 	}
 }
 
+// Unlock cancels a refresh that can still land, the release then finds a
+// version the holder wrote itself and has to release it instead of leaving the
+// lock to expire
+func TestUnlockReleasesUnseenRefresh(t *testing.T) {
+	prefix := testPrefix(t)
+	name := "issue_cert_unseen.example.com"
+
+	holder := newTestStorage(t, prefix)
+	waiter := newTestStorage(t, prefix)
+
+	// the refresher stays idle, the test writes the refresh that landed unseen
+	shorten(t, &lockRefreshInterval, time.Hour)
+
+	ctx := t.Context()
+
+	if err := holder.Lock(ctx, name); err != nil {
+		t.Fatalf("holder lock: %v", err)
+	}
+
+	key := holder.lockKey(name)
+	holder.locksMu.Lock()
+	held := holder.locks[key]
+	holder.locksMu.Unlock()
+
+	landed := lockInfo{Owner: held.owner, Created: held.created, Refreshed: time.Now()}
+	if _, err := holder.writeLock(ctx, key, landed, held.etag); err != nil {
+		t.Fatalf("write the unseen refresh: %v", err)
+	}
+
+	if err := holder.Unlock(ctx, name); err != nil {
+		t.Fatalf("holder unlock: %v", err)
+	}
+
+	stored, _, err := holder.loadLock(ctx, key)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if !stored.Released {
+		t.Fatal("the lock was left unreleased")
+	}
+
+	if taken, err := waiter.TryLock(ctx, name); !taken || err != nil {
+		t.Fatalf("try lock after release: %v, %v", taken, err)
+	}
+	if err := waiter.Unlock(ctx, name); err != nil {
+		t.Fatalf("waiter unlock: %v", err)
+	}
+}
+
+// a refresh answered only to a retry lands without its etag reaching the
+// holder, the next refresh fails its swap and has to carry on from the stored
+// version instead of letting the lock expire under its holder
+func TestRefreshSurvivesUnseenWrite(t *testing.T) {
+	prefix := testPrefix(t)
+	name := "issue_cert_refresh.example.com"
+
+	holder := newTestStorage(t, prefix)
+	waiter := newTestStorage(t, prefix)
+
+	shorten(t, &lockRefreshInterval, time.Second)
+	shorten(t, &lockTTL, 3*time.Second)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+
+	if err := holder.Lock(ctx, name); err != nil {
+		t.Fatalf("holder lock: %v", err)
+	}
+
+	key := holder.lockKey(name)
+	holder.locksMu.Lock()
+	owner := holder.locks[key].owner
+	holder.locksMu.Unlock()
+
+	// rewrite the lock as its holder behind the refresher's back
+	for {
+		stored, stat, err := holder.loadLock(ctx, key)
+		if err != nil {
+			t.Fatalf("load: %v", err)
+		}
+
+		landed := lockInfo{Owner: owner, Created: stored.Created, Refreshed: time.Now()}
+		_, err = holder.writeLock(ctx, key, landed, stat.ETag)
+		if err == nil {
+			break
+		}
+		if !isPreconditionFailed(err) {
+			t.Fatalf("write the unseen refresh: %v", err)
+		}
+	}
+
+	// two expiries pass while the holder keeps the lock
+	time.Sleep(2 * lockTTL)
+
+	if taken, err := waiter.TryLock(ctx, name); taken || err != nil {
+		t.Fatalf("try lock while held: %v, %v", taken, err)
+	}
+
+	if err := holder.Unlock(ctx, name); err != nil {
+		t.Fatalf("holder unlock: %v", err)
+	}
+	if taken, err := waiter.TryLock(ctx, name); !taken || err != nil {
+		t.Fatalf("try lock after release: %v, %v", taken, err)
+	}
+	if err := waiter.Unlock(ctx, name); err != nil {
+		t.Fatalf("waiter unlock: %v", err)
+	}
+}
+
 // shorten sets a timing knob for one test so it runs in seconds
 func shorten[T any](t *testing.T, knob *T, value T) {
 	t.Helper()

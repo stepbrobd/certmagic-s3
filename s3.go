@@ -78,8 +78,11 @@ type lockInfo struct {
 }
 
 // heldLock is a lock this instance owns
-// etag is the version its last write produced, the refresher owns it until
-// done is closed and a release replaces exactly that version
+// etag is the last version this holder knows it wrote, the refresher owns it
+// until done is closed and a release replaces exactly that version
+// a write can land without its etag arriving, canceled in flight or answered
+// only to a retry, so a failed swap rereads the lock and adopts the stored
+// version while it still names this owner
 type heldLock struct {
 	owner   string
 	created time.Time
@@ -412,7 +415,7 @@ func (s3 *S3) Unlock(ctx context.Context, name string) error {
 	}
 	defer func() { <-s3.gate(key) }()
 
-	// no refresh may land after the version the release replaces was read
+	// no refresh starts after this, one canceled in flight may still land
 	held.cancel()
 	<-held.done
 
@@ -420,14 +423,30 @@ func (s3 *S3) Unlock(ctx context.Context, name string) error {
 
 	return s3.retry(ctx, key, "releasing lock", func() (bool, error) {
 		_, err := s3.writeLock(ctx, key, release, held.etag)
-		switch {
-		case err == nil, isNotExist(err):
-			return true, nil
-		case isPreconditionFailed(err):
-			s3.logger.Warn("lock was reclaimed, leaving it", zap.String("key", key))
+		if err == nil || isNotExist(err) {
 			return true, nil
 		}
-		return false, err
+		if !isPreconditionFailed(err) {
+			return false, err
+		}
+
+		stored, stat, err := s3.loadLock(ctx, key)
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			return true, nil
+		case err != nil:
+			return false, err
+		case stored.Owner != held.owner:
+			s3.logger.Warn("lock was reclaimed, leaving it", zap.String("key", key), zap.String("owner", stored.Owner))
+			return true, nil
+		case stored.Released:
+			// an earlier attempt landed and only its answer was lost
+			return true, nil
+		}
+
+		// the stored version is a write of this holder, release that one
+		held.etag = stat.ETag
+		return false, nil
 	})
 }
 
@@ -617,9 +636,26 @@ func (s3 *S3) keepLockFresh(ctx context.Context, key string, held *heldLock) {
 			interval = lockRefreshInterval
 			continue
 		}
-		// the swap fails only once the lock was reclaimed or removed
-		if isPreconditionFailed(err) || isNotExist(err) {
+		if isNotExist(err) {
 			s3.logger.Warn("lock moved on, stopping refresh", zap.String("key", key), zap.Error(err))
+			return
+		}
+		if isPreconditionFailed(err) {
+			stored, stat, loadErr := s3.loadLock(ctx, key)
+			switch {
+			case loadErr == nil && stored.Owner == held.owner && !stored.Released:
+				// a refresh answered only to a retry landed unseen, carry on from it
+				held.etag = stat.ETag
+				interval = lockPollInterval
+				continue
+			case loadErr == nil, errors.Is(loadErr, fs.ErrNotExist):
+				s3.logger.Warn("lock moved on, stopping refresh", zap.String("key", key), zap.String("owner", stored.Owner))
+				return
+			}
+			err = loadErr
+		}
+		// Unlock canceled the request and settles itself where the lock stands
+		if ctx.Err() != nil {
 			return
 		}
 		s3.logger.Warn("extending a held lock failed, retrying", zap.String("key", key), zap.Error(err))
