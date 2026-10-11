@@ -2,6 +2,7 @@ package s3
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -42,6 +43,9 @@ const (
 
 	// how many transient s3 failures to absorb before failing an acquisition or a release
 	lockRetryLimit = 5
+
+	// how long removing the probe object may take, the probe deadline may have passed
+	probeCleanupTimeout = 10 * time.Second
 )
 
 // the tests shrink these to run in seconds
@@ -54,7 +58,14 @@ var (
 
 	// how often a waiter retries acquisition
 	lockPollInterval = time.Second
+
+	// how long Provision retries a probe that got no definite answer, a boot can
+	// start caddy before dns answers or the clock is set
+	probeTimeout = time.Minute
 )
+
+// errUnconditionalWrites is the one probe result that retrying cannot change
+var errUnconditionalWrites = errors.New("it does not honor conditional writes and locks would exclude nobody")
 
 // lockInfo is the body of a lock object
 // staleness is judged from the object's last write on the server, no holder
@@ -248,7 +259,38 @@ func (s3 *S3) Provision(ctx caddy.Context) error {
 
 // verifyConditionalWrites fails when the backend accepts a conditional put it
 // had to refuse, since locks would then exclude nobody
+// any other failure leaves that question open and is retried until probeTimeout
 func (s3 *S3) verifyConditionalWrites(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+
+	gaveUp := func(err error) error {
+		return fmt.Errorf("gave up after %s: %w", probeTimeout, err)
+	}
+
+	var last error
+	for {
+		err := s3.probeConditionalWrites(ctx)
+		if err == nil || errors.Is(err, errUnconditionalWrites) {
+			return err
+		}
+		// a request the deadline cut short says less than the failure before it
+		if ctx.Err() != nil {
+			return gaveUp(cmp.Or(last, err))
+		}
+		last = err
+
+		s3.logger.Warn("probing the bucket failed, retrying", zap.String("bucket", s3.Bucket), zap.Error(err))
+
+		if wait(ctx, lockPollInterval) != nil {
+			return gaveUp(last)
+		}
+	}
+}
+
+// probeConditionalWrites makes one attempt, each under a fresh key so a write
+// that landed unseen in an earlier attempt cannot fail this one
+func (s3 *S3) probeConditionalWrites(ctx context.Context) error {
 	owner, err := newLockOwner()
 	if err != nil {
 		return err
@@ -262,7 +304,10 @@ func (s3 *S3) verifyConditionalWrites(ctx context.Context) error {
 		return fmt.Errorf("writing a probe object to bucket %s: %w", s3.Bucket, err)
 	}
 	defer func() {
-		if err := s3.client.RemoveObject(context.WithoutCancel(ctx), s3.Bucket, key, minio.RemoveObjectOptions{}); err != nil {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), probeCleanupTimeout)
+		defer cancel()
+
+		if err := s3.client.RemoveObject(ctx, s3.Bucket, key, minio.RemoveObjectOptions{}); err != nil {
 			s3.logger.Warn("removing the probe object failed", zap.String("key", key), zap.Error(err))
 		}
 	}()
@@ -280,7 +325,7 @@ func (s3 *S3) verifyConditionalWrites(ctx context.Context) error {
 // conditionalWriteError describes a probe the backend had to refuse with a 412
 func conditionalWriteError(what string, err error) error {
 	if err == nil {
-		return fmt.Errorf("the backend accepted %s, it does not honor conditional writes and locks would exclude nobody", what)
+		return fmt.Errorf("the backend accepted %s, %w", what, errUnconditionalWrites)
 	}
 
 	return fmt.Errorf("the backend answered %s with %w instead of a 412", what, err)

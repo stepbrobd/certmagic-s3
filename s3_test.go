@@ -6,13 +6,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"slices"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -132,6 +137,167 @@ func TestProvision(t *testing.T) {
 	if storage.Exists(t.Context(), lockPrefix) {
 		t.Fatal("the probe object was left behind")
 	}
+}
+
+// a boot can start caddy before the backend is reachable, the start has to
+// wait for it instead of failing for good
+func TestProvisionWaitsForBackend(t *testing.T) {
+	prefix := testPrefix(t)
+	backend := newTestStorage(t, prefix)
+	if envOr("S3_TEST_INSECURE", "") == "" {
+		t.Skip("relaying to the backend needs plain http")
+	}
+
+	// one request per attempt, so the probe's own retry is what recovers
+	shorten(t, &minio.MaxRetry, 1)
+	shorten(t, &lockPollInterval, 100*time.Millisecond)
+
+	addr := closedAddress(t)
+	relayLater(t, addr, envOr("S3_TEST_HOST", ""), 2*time.Second)
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: t.Context()})
+	defer cancel()
+
+	storage := &S3{
+		Host:      addr,
+		Bucket:    backend.Bucket,
+		AccessID:  envOr("S3_TEST_ACCESS_ID", ""),
+		SecretKey: envOr("S3_TEST_SECRET_KEY", ""),
+		Prefix:    prefix,
+		Insecure:  true,
+	}
+
+	start := time.Now()
+	if err := storage.Provision(ctx); err != nil {
+		t.Fatalf("provision: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 2*time.Second {
+		t.Fatalf("provision finished after %s, before the backend came up", elapsed)
+	}
+}
+
+// a probe that never gets an answer gives up at its deadline, and the error
+// names the failure rather than the deadline that ended it
+func TestProvisionGivesUp(t *testing.T) {
+	shorten(t, &minio.MaxRetry, 1)
+	shorten(t, &lockPollInterval, 100*time.Millisecond)
+	shorten(t, &probeTimeout, 2*time.Second)
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: t.Context()})
+	defer cancel()
+
+	storage := &S3{Host: closedAddress(t), Bucket: "certmagic-test", AccessID: "id", SecretKey: "secret", Insecure: true}
+
+	start := time.Now()
+	err := storage.Provision(ctx)
+	elapsed := time.Since(start)
+
+	if !errors.Is(err, syscall.ECONNREFUSED) {
+		t.Fatalf("expected a refused connection, got %v", err)
+	}
+	if elapsed < probeTimeout {
+		t.Fatalf("gave up after %s, before the %s deadline", elapsed, probeTimeout)
+	}
+}
+
+// a backend that accepts a write it had to refuse fails the start at once,
+// no retry makes its locks exclude anyone
+func TestProvisionRefusesUnconditionalWrites(t *testing.T) {
+	// answers every write with success, whatever its conditions
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Query().Has("location"):
+			fmt.Fprint(w, `<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">us-east-1</LocationConstraint>`)
+		case r.Method == http.MethodPut:
+			w.Header().Set("ETag", `"d41d8cd98f00b204e9800998ecf8427e"`)
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		}
+	}))
+	defer server.Close()
+
+	ctx, cancel := caddy.NewContext(caddy.Context{Context: t.Context()})
+	defer cancel()
+
+	storage := &S3{Host: server.Listener.Addr().String(), Bucket: "certmagic-test", AccessID: "id", SecretKey: "secret", Insecure: true}
+
+	start := time.Now()
+	err := storage.Provision(ctx)
+
+	if !errors.Is(err, errUnconditionalWrites) {
+		t.Fatalf("expected the backend to be refused, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed >= probeTimeout {
+		t.Fatalf("a definite answer was retried for %s", elapsed)
+	}
+}
+
+// closedAddress returns a local address nothing listens on
+func closedAddress(t *testing.T) string {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	return listener.Addr().String()
+}
+
+// relayLater starts listening on addr after delay and relays every connection
+// to target, the way a backend becomes reachable once the network is up
+func relayLater(t *testing.T, addr, target string, delay time.Duration) {
+	t.Helper()
+
+	var (
+		mu       sync.Mutex
+		listener net.Listener
+		conns    []net.Conn
+	)
+
+	timer := time.AfterFunc(delay, func() {
+		l, err := net.Listen("tcp", addr)
+		if err != nil {
+			t.Errorf("listen on %s: %v", addr, err)
+			return
+		}
+		mu.Lock()
+		listener = l
+		mu.Unlock()
+
+		for {
+			client, err := l.Accept()
+			if err != nil {
+				return
+			}
+			upstream, err := net.Dial("tcp", target)
+			if err != nil {
+				client.Close()
+				continue
+			}
+			mu.Lock()
+			conns = append(conns, client, upstream)
+			mu.Unlock()
+
+			go io.Copy(upstream, client)
+			go io.Copy(client, upstream)
+		}
+	})
+
+	t.Cleanup(func() {
+		timer.Stop()
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		if listener != nil {
+			listener.Close()
+		}
+		for _, conn := range conns {
+			conn.Close()
+		}
+	})
 }
 
 // mutual exclusion is the entire point of the locker
@@ -285,12 +451,12 @@ func TestLockReclaimsAbandoned(t *testing.T) {
 	}
 }
 
-// shorten sets a lock interval for one test so it runs in seconds
-func shorten(t *testing.T, interval *time.Duration, d time.Duration) {
+// shorten sets a timing knob for one test so it runs in seconds
+func shorten[T any](t *testing.T, knob *T, value T) {
 	t.Helper()
-	previous := *interval
-	*interval = d
-	t.Cleanup(func() { *interval = previous })
+	previous := *knob
+	*knob = value
+	t.Cleanup(func() { *knob = previous })
 }
 
 // envOr keeps the test setup free of repeated os.Getenv noise
