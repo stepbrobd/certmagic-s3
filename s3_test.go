@@ -26,6 +26,7 @@ import (
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 // these exercise the locker against a real endpoint
@@ -418,6 +419,9 @@ func TestLockReclaimsAbandoned(t *testing.T) {
 	storage := newTestStorage(t, prefix)
 	key := storage.lockKey(name)
 
+	core, logs := observer.New(zap.WarnLevel)
+	storage.logger = zap.New(core)
+
 	// the seeded lock is stale once its write is older than the expiry
 	shorten(t, &lockTTL, 2*time.Second)
 
@@ -448,6 +452,47 @@ func TestLockReclaimsAbandoned(t *testing.T) {
 	}
 	if stored.Owner == "dead-node/deadbeef" {
 		t.Fatal("abandoned lock was not reclaimed")
+	}
+	if logs.FilterMessage("reclaiming an abandoned lock").Len() == 0 {
+		t.Fatal("reclaiming an abandoned lock was not logged")
+	}
+}
+
+// a released lock is free at any age, taking it over reclaims nothing and must
+// not be logged as an abandoned lock
+func TestReleasedLockTakenQuietly(t *testing.T) {
+	prefix := testPrefix(t)
+	name := "storage_clean"
+
+	first := newTestStorage(t, prefix)
+	second := newTestStorage(t, prefix)
+
+	core, logs := observer.New(zap.WarnLevel)
+	second.logger = zap.New(core)
+
+	shorten(t, &lockTTL, time.Second)
+
+	ctx := t.Context()
+
+	if err := first.Lock(ctx, name); err != nil {
+		t.Fatalf("first lock: %v", err)
+	}
+	if err := first.Unlock(ctx, name); err != nil {
+		t.Fatalf("first unlock: %v", err)
+	}
+
+	// the released lock ages past the expiry
+	time.Sleep(2 * lockTTL)
+
+	if err := second.Lock(ctx, name); err != nil {
+		t.Fatalf("second lock: %v", err)
+	}
+	if err := second.Unlock(ctx, name); err != nil {
+		t.Fatalf("second unlock: %v", err)
+	}
+
+	if n := logs.FilterMessage("reclaiming an abandoned lock").Len(); n != 0 {
+		t.Fatalf("taking a released lock logged %d abandoned lock warnings", n)
 	}
 }
 

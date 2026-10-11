@@ -464,7 +464,8 @@ func (s3 *S3) acquire(ctx context.Context, key, owner string) (bool, error) {
 	if !existing.Released && !stale {
 		return false, nil
 	}
-	if stale {
+	// a released lock is free at any age, only a stale claim was abandoned
+	if !existing.Released {
 		s3.logger.Warn("reclaiming an abandoned lock", zap.String("key", key), zap.String("owner", existing.Owner), zap.Time("last_write", stat.LastModified))
 	}
 
